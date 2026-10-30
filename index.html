@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>현대중공업지부 참석확인서 집계</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -219,17 +219,227 @@ async function ghFetch(endpoint, options = {}) {
   return res.json();
 }
 
+// ============================================================
+// 안전한 저장 (동시 작업 보호)
+//  - 파일을 읽을 때의 sha를 기억했다가 그 sha로 저장한다 → 그 사이 다른 사람이 바꿨으면 GitHub가 저장을 거절(충돌)한다.
+//  - 충돌이면 "최신 데이터"를 다시 읽어 내 변경만 다시 적용한 뒤 재시도한다. (서로 다른 항목은 함께 보존된다)
+//  - 같은 항목을 다른 사람이 먼저 바꿨다면 자동으로 덮어쓰지 않고 중단한다.
+//  - 저장이 실패하면 ok:false를 돌려준다. 호출하는 쪽은 ok일 때만 성공 메시지를 보여준다.
+// ============================================================
+class ConflictError extends Error {}
+class StaleError extends ConflictError { constructor(msg, latest, sha) { super(msg); this.latest = latest; this.sha = sha; } }   // 내가 본 이후 다른 사용자가 바꿨다 (최신 내용 포함)
+function readFail_(path, status) { const e = new Error(`${path} 읽기 실패 (${status})`); e.status = status; return e; }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const ghHeaders = (accept) => ({ Authorization: `Bearer ${getToken()}`, Accept: accept || 'application/vnd.github+json' });
+const ghUrl = (path) => `${GH_API}/contents/${path}?ref=${GH_BRANCH}&_=${Date.now()}`;
+
+// 파일의 sha만 확인한다. (큰 파일은 기본 조회가 내용 없이 sha만 돌려주거나 막힐 수 있어 폴더 목록으로도 시도)
+async function ghGetSha(path) {
+  try {
+    const r = await fetch(ghUrl(path), { headers: ghHeaders(), cache: 'no-store' });
+    if (r.ok) { const j = await r.json(); if (j && j.sha) return j.sha; }
+    if (r.status === 404) return null;
+  } catch (e) { /* 아래에서 재시도 */ }
+  try {
+    const dir = path.split('/').slice(0, -1).join('/');
+    const r = await fetch(ghUrl(dir), { headers: ghHeaders(), cache: 'no-store' });
+    if (!r.ok) return null;
+    const list = await r.json();
+    const hit = Array.isArray(list) ? list.find(x => x.path === path) : null;
+    return hit ? hit.sha : null;
+  } catch (e) { return null; }
+}
+
+// 반환: { data, sha, exists } — data와 sha는 같은 시점의 것이다.
+async function ghGetJSON(path, fallback) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const r1 = await fetch(ghUrl(path), { headers: ghHeaders(), cache: 'no-store' });
+    if (r1.status === 404) return { data: fallback, sha: null, exists: false };
+    let j1 = null;
+    if (r1.ok) j1 = await r1.json();
+    else if (r1.status !== 403) throw readFail_(path, r1.status);
+    if (j1 && j1.content && j1.encoding === 'base64') {   // 1MB 이하: 내용과 sha가 한 번에 온다
+      try { return { data: JSON.parse(b64DecodeUnicode(j1.content)), sha: j1.sha, exists: true }; }
+      catch (e) { throw new Error(`${path} 내용을 해석하지 못했습니다`); }
+    }
+    // 1MB 초과: 파일 식별값(sha)으로 정해진 blob을 읽는다. blob 내용은 sha로 결정되는 불변 값이라 "내용과 식별값이 서로 다른 버전"이 될 수 없다.
+    // raw 방식이 실패하면 같은 blob을 JSON(base64)으로 다시 읽는다. 둘 다 실패하면 "브랜치의 최신 내용 + 앞뒤 sha 비교" 같은 불안전한 방식으로 돌아가지 않고 읽기를 실패로 끝낸다. (저장 작업은 중단된다)
+    const sha1 = (j1 && j1.sha) || await ghGetSha(path);
+    if (!sha1) throw new Error(`${path} 읽기 실패 (파일 식별값을 확인하지 못했습니다)`);
+    let blobText = null;
+    try { const rb = await fetch(`${GH_API}/git/blobs/${sha1}`, { headers: { ...ghHeaders(), Accept: 'application/vnd.github.raw+json' }, cache: 'no-store' }); if (rb.ok) blobText = await rb.text(); } catch (e) { /* 아래에서 JSON 방식으로 다시 읽는다 */ }
+    if (blobText === null) {
+      try { const rj = await fetch(`${GH_API}/git/blobs/${sha1}`, { headers: ghHeaders(), cache: 'no-store' }); if (rj.ok) { const jb = await rj.json(); if (jb && jb.encoding === 'base64' && typeof jb.content === 'string') blobText = b64DecodeUnicode(jb.content); } } catch (e) { /* 둘 다 실패 */ }
+    }
+    if (blobText === null) throw new Error(`${path} 큰 파일을 내용과 식별값이 일치하는 방식으로 읽지 못해 작업을 중단했습니다. 잠시 후 다시 시도하세요. (기존 데이터는 그대로입니다)`);
+    try { return { data: JSON.parse(blobText), sha: sha1, exists: true }; }
+    catch (e) { throw new Error(`${path} 내용을 해석하지 못했습니다`); }
+  }
+  throw new Error(`${path}가 계속 바뀌고 있어 읽지 못했습니다`);
+}
+
+function friendlyHttpError_(status, text) {
+  if (status === 401) return 'GitHub 토큰이 유효하지 않습니다. 사용자 설정에서 토큰을 다시 등록하세요.';
+  if (status === 403 || status === 429) return /rate limit/i.test(text) ? 'GitHub 호출 한도를 넘었습니다. 잠시 후 다시 시도하세요.' : '저장 권한이 없습니다. 토큰이 이 저장소의 Contents: Read and write 권한을 갖고 있는지 확인하세요.';
+  if (status === 404) return '저장소 또는 파일을 찾을 수 없습니다. 토큰 권한과 저장소 이름을 확인하세요.';
+  if (status === 422) return `GitHub가 요청을 거절했습니다 (422). ${String(text).slice(0, 120)}`;
+  return `GitHub 저장 오류 (${status})`;
+}
+
+// path 파일을 data로 저장한다. sha를 주면 "그 버전일 때만" 저장된다.
+
+// mutator(최신 데이터의 복사본) → { data: 새 데이터, result } 또는 null(바꿀 것 없음).
+// 같은 항목 충돌이면 mutator가 ConflictError를 던진다 → 저장하지 않고 중단한다.
+// opts.beforeWrite(최신 데이터, 새 데이터, result): 저장 직전 백업 등. 던지면 저장하지 않는다.
+let PUT_TIMEOUT_MS = 120000;   // 저장 요청이 이 시간 안에 끝나지 않으면 "결과를 알 수 없음"으로 보고 실제 상태를 다시 확인한다
+const sameJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// 저장(PUT) 요청이 "어떻게 끝났는지 알 수 없을 때"(네트워크 오류·시간 초과·서버 오류) GitHub에는 실제로 반영됐을 수 있다.
+// 그래서 최신 데이터를 다시 읽어 확인한다: 내가 저장하려던 내용과 같으면 반영된 것, 저장 전 버전 그대로면 반영되지 않은 것.
+async function settleAmbiguous_(path, data, prevSha, why) {
+  // 저장 요청의 응답을 받지 못한 뒤의 확인이다. 서버가 아직 처리 중일 수 있어서 어떤 관측도 "반영되지 않았다"를 증명하지 못한다.
+  // 내용이 정확히 내가 보낸 것과 같을 때만 반영된 것으로 본다. 그 밖의 모든 경우는 "결과 불명확"(unknown)이며,
+  // 호출한 쪽은 같은 저장을 자동으로 다시 보내지 않고 실패로 단정하지도 않는다. (확인 간격은 안전 판단의 기준이 아니라 단순한 조회 간격이다)
+  let unchanged = 0, errs = 0;   // errs: 조회 자체가 실패한 횟수(3번이면 확인을 포기하고 "결과 불명확")
+  for (let i = 0; i < 6; i++) {
+    try {
+      const now = await ghGetJSON(path, null);
+      if (now.exists && sameJSON(now.data, data)) return { ok: true, landed: true };
+      if ((now.sha || null) !== (prevSha || null)) return { ok: false, unknown: true, ambiguous: true, changedMeanwhile: true, error: '저장 요청의 응답을 받지 못했고, 그 사이 다른 변경이 있어 내 저장이 반영됐는지 확정하지 못했습니다. 화면을 새로고침해서 확인하세요. (같은 작업을 바로 다시 누르지 마세요)' };
+      if (++unchanged >= 2) return { ok: false, unknown: true, ambiguous: true, notLanded: true, error: `${why}로 저장 결과를 확정하지 못했습니다. 지금까지는 GitHub에 반영되지 않은 것으로 보이지만 요청이 늦게 반영될 수 있으니, 잠시 뒤 화면을 새로고침해서 확인하세요. (같은 작업을 바로 다시 누르지 마세요)` };
+      await sleep(2500);
+    } catch (e) { if (++errs >= 3) break; await sleep(400 * errs); }
+  }
+  return { ok: false, network: true, unknown: true, ambiguous: true, error: `${why}로 저장 결과를 확인하지 못했습니다. GitHub에 반영됐을 수 있으니 화면을 새로고침해서 확인하세요.` };
+}
+
+// path 파일을 data로 저장한다. sha를 주면 "그 버전일 때만" 저장된다.
+async function ghPutJSON(path, data, message, sha) {
+  const body = { message, content: b64EncodeUnicode(JSON.stringify(data)), branch: GH_BRANCH };
+  if (sha) body.sha = sha;
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), PUT_TIMEOUT_MS) : null;
+  let res;
+  try { res = await fetch(`${GH_API}/contents/${path}`, { method: 'PUT', headers: ghHeaders(), body: JSON.stringify(body), signal: ctl ? ctl.signal : undefined }); }
+  catch (e) { return settleAmbiguous_(path, data, sha, (e && e.name === 'AbortError') ? '응답 시간 초과' : '네트워크 오류'); }
+  finally { if (timer) clearTimeout(timer); }
+  if (res.ok) return { ok: true };
+  let text = ''; try { text = await res.text(); } catch (e) { /* 무시 */ }
+  if (res.status >= 500) return settleAmbiguous_(path, data, sha, `GitHub 서버 오류(${res.status})`);
+  const conflict = res.status === 409 || (res.status === 422 && /sha/i.test(text));
+  return { ok: false, conflict, status: res.status, error: conflict ? '다른 사용자가 먼저 저장해서 충돌했습니다.' : friendlyHttpError_(res.status, text) };
+}
+
+// 미리보기·승인 시점의 데이터와 저장 직전의 최신 데이터가 "실제로 다른지" 판단한다. (파일 식별값이 달라도 내용이 같으면 같은 것으로 본다)
+const changedSince = (baseSha, baseData, nowSha, nowData) => nowSha !== baseSha && !sameJSON(nowData, baseData);
+
+async function mutateJSON(path, fallback, mutator, message, opts = {}) {
+  const attempts = opts.attempts || 6;
+  let last = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let cur;
+    try { cur = await ghGetJSON(path, fallback); }
+    catch (e) {
+      const st = e && e.status;
+      return { ok: false, error: e.message || String(e), retryable: !(st >= 400 && st < 500 && st !== 429 && st !== 408) };
+    }
+    let out;
+    try { out = mutator(JSON.parse(JSON.stringify(cur.data)), { sha: cur.sha, exists: cur.exists }); }
+    catch (e) {
+      if (e instanceof ConflictError) return { ok: false, conflict: true, itemConflict: true, error: e.message, stale: e instanceof StaleError ? { data: e.latest, sha: e.sha } : undefined };
+      throw e;
+    }
+    if (!out || out.data === undefined) return { ok: true, unchanged: true, data: cur.data, result: out ? out.result : undefined };
+    if (opts.beforeWrite) {
+      try { await opts.beforeWrite(cur.data, out.data, out.result); }
+      catch (e) { return { ok: false, backupFailed: true, error: e.message || String(e) }; }
+    }
+    const msg = typeof message === 'function' ? message(out.result) : message;
+    const put = await ghPutJSON(path, out.data, msg, cur.exists ? cur.sha : undefined);
+    if (put.ok) { _cache[path] = { data: out.data, at: Date.now() }; return { ok: true, data: out.data, result: out.result, verified: !!put.landed }; }
+    last = put;
+    if (put.unknown) return { ok: false, unknown: true, retryable: false, error: put.error };   // 반영 여부를 확인하지 못함: 임의로 재시도하지 않고 알린다
+    if (!(put.conflict || put.network || put.status >= 500)) return { ok: false, error: put.error, retryable: false };
+    await sleep(250 * (attempt + 1) + Math.random() * 250);
+  }
+  return { ok: false, retryable: true, conflict: !!(last && last.conflict), error: last && last.conflict ? '다른 사용자가 계속 수정 중이라 저장하지 못했습니다. 잠시 후 다시 시도하세요. (기존 데이터는 그대로입니다)' : ((last && last.error) || '저장하지 못했습니다.') };
+}
+
+// 항목 비교용 도우미
+const MEMBER_FIELDS = ['group', 'name', 'dept', 'phone', 'bank', 'account', 'holder'];
+const norm = (v) => String(v ?? '').trim();
+const memKey = (m) => norm(m && m.empId).toUpperCase();
+const sameMember = (a, b) => memKey(a) === memKey(b) && MEMBER_FIELDS.every(f => norm(a[f]) === norm(b[f]));
+const sameUser = (a, b) => ['empId', 'name', 'role', 'status', 'password'].every(f => norm(a[f]) === norm(b[f]));
+
+// 엑셀 읽기 (라이브러리 확인 + 파일 크기 제한 + 오류 안내)
+const MAX_XLSX_BYTES = 10 * 1024 * 1024;
+function requireXlsx() {
+  if (typeof XLSX === 'undefined') {
+    alert('엑셀 라이브러리를 불러오지 못했습니다. 인터넷 연결(또는 cdn.sheetjs.com 접속 차단 여부)을 확인한 뒤 새로고침하세요.');
+    return false;
+  }
+  return true;
+}
+// 엑셀 숫자 칸은 15자리까지만 정확하고, 긴 숫자는 지수(1.23457E+12)로 표시된다.
+// 지수를 일반 숫자로 바꿔 쓴다고 원본(자릿수·앞자리 0)이 복구되는 것이 아니므로, 확인할 수 없는 값은 저장하지 않는다.
+// 아래 판단은 사번·계좌번호 칸에만 쓴다. (텍스트 칸과 하이픈이 든 값은 그대로 통과한다)
+function makeCellChecker(ws) {
+  const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+  const cellAt = (i, j) => ws[XLSX.utils.encode_cell({ r: range.s.r + i, c: range.s.c + j })];
+  return {
+    rowNo: (i) => range.s.r + i + 1,
+    cellNumeric: (i, j) => { const c = cellAt(i, j); return !!c && c.t === 'n'; },
+    cellRisk: (i, j, strict) => {
+      if (j < 0) return null;
+      const c = cellAt(i, j); if (!c) return null;
+      if (c.t === 'n') {
+        const v = c.v, w = String(c.w ?? '');
+        if (strict) {   // 계좌번호 칸: 숫자 서식이면 자릿수·표시 서식과 상관없이 저장하지 않는다. (앞자리 0이 이미 없어졌는지 앱이 알 수 없음)
+          const kind = /e/i.test(w) ? '지수 표기' : (!Number.isInteger(v) ? '소수점 숫자' : (Math.abs(v) >= 1e15 ? '15자리 초과' : '숫자 서식'));
+          return `${kind} — 숫자 서식 칸은 앞자리 0이 이미 없어졌을 수 있어 원래 값을 확인할 수 없음`;
+        }
+        if (/e/i.test(w)) return `숫자 칸이 지수 표기(${w})로 표시됨 — 원래 자릿수와 앞자리 0을 확인할 수 없음`;
+        if (!Number.isFinite(v) || !Number.isInteger(v)) return '소수점이 있는 숫자라 값을 확인할 수 없음';
+        if (Math.abs(v) >= 1e15) return '15자리 초과 숫자 — 엑셀 숫자 칸의 정밀도 한계(15자리)를 넘어 정확한 값을 확인할 수 없음';
+        if (!(/^\d+$/.test(w) && Number(w) === v)) return `표시 형식(${w})이 숫자 원본과 달라 값을 확인할 수 없음`;
+        return null;
+      }
+      const s = String(c.v ?? '').trim();
+      if (/^\d(\.\d+)?e[+-]?\d+$/i.test(s)) return '지수 표기 글자 — 이미 손상된 값으로 의심됨';
+      return null;
+    }
+  };
+}
+async function readSheetRows(file) {
+  if (!requireXlsx()) return null;
+  if (file.size > MAX_XLSX_BYTES) { alert('엑셀 파일이 너무 큽니다(10MB 초과). 파일을 나누어 올려주세요.'); return null; }
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+    const chk = makeCellChecker(ws);
+    rows.rowNo = chk.rowNo; rows.cellRisk = chk.cellRisk; rows.cellNumeric = chk.cellNumeric;   // 행 번호·칸 검사 도우미 (값 자체는 기존과 같다)
+    return rows;
+  } catch (e) {
+    alert('엑셀 파일을 읽지 못했습니다. 파일이 손상되었거나 지원하지 않는 형식일 수 있습니다.');
+    return null;
+  }
+}
+
+// [참고] commitFiles/commitSingleFile은 이제 '최초 설정(여러 파일 동시 생성)'에서만 쓴다. 일반 저장은 mutateJSON을 쓴다.
 // filesObj: { 'data/events.json': arrayOrObject, ... } — 한 번의 커밋으로 여러 파일 동시 반영
 // 여러 탭/사용자가 동시에 쓰기 작업을 하면 "fast forward" 충돌이 나므로, 실패 시 매번
 // 최신 상태를 다시 읽어 자동으로 여러 번 재시도한다. 사용자는 보통 버튼을 다시 누를 필요가 없다.
 // 파일 1개만 바꿀 땐 Contents API로 2번만 호출해서 빠르게 저장(대부분의 경우).
 // 파일 여러 개를 한 번에 바꿔야 할 땐(예: 일정 삭제 시 일정+출석기록 동시 반영) 기존의
 // 원자적 커밋(Git Data API, 6단계) 방식을 그대로 쓴다.
-async function commitFiles(filesObj, message, retries = 6) {
+async function commitFiles(filesObj, message, retries = 6, createOnly = false) {
   const paths = Object.keys(filesObj);
   const res = paths.length === 1
     ? await commitSingleFile(paths[0], filesObj[paths[0]], message, retries)
-    : await commitFilesAtomic(filesObj, message, retries);
+    : await commitFilesAtomic(filesObj, message, retries, createOnly);
   if (res.ok) paths.forEach(p => { _cache[p] = { data: filesObj[p], at: Date.now() }; });
   return res;
 }
@@ -268,12 +478,25 @@ async function commitSingleFile(path, data, message, retries = 6) {
   return { ok: false, error: friendlyCommitError_(lastErr) };
 }
 
-async function commitFilesAtomic(filesObj, message, retries = 6) {
+async function commitFilesAtomic(filesObj, message, retries = 6, createOnly = false) {
   let lastErr = null;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const ref = await ghFetch(`/git/ref/heads/${GH_BRANCH}`);
       const latestSha = ref.object.sha;
+      if (createOnly) {   // 최초 설정: 이 파일들 중 하나라도 이미 있으면(다른 사용자가 먼저 설정했거나 일부 데이터가 남아 있으면) 덮어쓰지 않고 중단한다. 재시도할 때마다 다시 확인한다.
+        const paths = Object.keys(filesObj); let existing = 0, same = 0, firstFound = '';
+        for (const p of paths) {
+          const r = await fetch(ghUrl(p), { headers: ghHeaders(), cache: 'no-store' });
+          if (r.ok) {
+            existing++; firstFound = firstFound || p;
+            if (attempt > 0) { try { const cur = await ghGetJSON(p, null); if (cur.exists && sameJSON(cur.data, filesObj[p])) same++; } catch (e) { /* 같은지 확인하지 못하면 다른 것으로 본다 */ } }
+          } else if (r.status !== 404) throw new Error(`${p} 확인 실패 (${r.status})`);
+        }
+        // 앞선 시도가 이미 반영됐고(응답만 유실) 내용이 내가 쓰려던 것과 같다면 성공이다.
+        if (attempt > 0 && existing === paths.length && same === existing) return { ok: true, verified: true };
+        if (existing) return { ok: false, exists: true, error: `이미 ${firstFound} 파일이 있어 최초 설정을 중단했습니다. 기존 데이터는 그대로입니다. 페이지를 새로고침해서 확인하세요.` };
+      }
       const commit = await ghFetch(`/git/commits/${latestSha}`);
       const baseTreeSha = commit.tree.sha;
 
@@ -412,6 +635,7 @@ document.getElementById('gateBtn').onclick = async () => {
     return; // 실패 원인을 보여주고, 최초 설정 화면으로 넘어가지 않는다 (데이터 보호)
   }
   setToken(token);
+  document.getElementById('gate_token').value = '';
   let users;
   try { users = await readJSON(PATHS.users, null); }
   catch (e) { msg.style.color = '#c62828'; msg.textContent = '데이터를 읽는 중 오류가 났습니다: ' + e.message; return; }
@@ -442,8 +666,8 @@ document.getElementById('bootBtn').onclick = async () => {
     [PATHS.events]: [],
     [PATHS.attendance]: [],
     [PATHS.members]: []
-  }, '초기 설정: 관리자 계정 생성');
-  if (!res.ok) { msg.textContent = '초기화 실패: ' + res.error + ' (토큰 권한을 확인하세요)'; return; }
+  }, '초기 설정: 관리자 계정 생성', 6, true);
+  if (!res.ok) { msg.textContent = '초기화 실패: ' + res.error + (res.exists ? '' : ' (토큰 권한을 확인하세요)'); return; }
   location.reload();
 };
 
@@ -486,7 +710,11 @@ function enterApp() {
 }
 
 document.getElementById('logoutBtn').onclick = () => {
+  // 공용 컴퓨터에서 토큰이 남지 않도록, 로그아웃할 때 토큰도 지울지 묻는다. (지우면 다음 접속 때 토큰을 다시 입력)
+  const clearToken = confirm('로그아웃합니다.\n\n이 컴퓨터에서 GitHub 토큰도 함께 지울까요?\n[확인] 토큰도 지움 (다음 접속 때 다시 입력)\n[취소] 토큰은 그대로 둠 (공용 컴퓨터라면 [확인]을 권장합니다)');
   sessionStorage.removeItem('slog_session');
+  if (clearToken) localStorage.removeItem(TOKEN_KEY);
+  Object.keys(_cache).forEach(k => delete _cache[k]);
   session = null;
   location.reload();
 };
@@ -553,7 +781,12 @@ async function renderEvents(content, offset = 0, preset = null) {
   const pageNumbers = [];
   for (let p = 0; p < totalPages; p++) pageNumbers.push(p);
 
+  const evIdSet = new Set(events.map(e => e.id));
+  const orphanCount = attendance.filter(a => !evIdSet.has(a.eventId)).length;
+  const orphanNotice = (isAdmin() && orphanCount > 0)
+    ? `<div class="notice" style="background:#fdeaea; color:#c62828; display:flex; justify-content:space-between; align-items:center; gap:10px; margin:0 0 10px;"><span>삭제된 일정의 출석기록 <b>${orphanCount.toLocaleString()}건</b>이 남아 있습니다. (일정 삭제 중 정리가 끝나지 못한 경우)</span><button class="primary" id="orphanBtn">안전하게 정리</button></div>` : '';
   content.innerHTML = `
+    ${orphanNotice}
     <div style="display:flex; justify-content:flex-end; margin-bottom:10px;">
       ${isAdmin() ? '<button class="primary" id="addEventBtn">일정 등록</button>' : ''}
     </div>
@@ -586,22 +819,14 @@ async function renderEvents(content, offset = 0, preset = null) {
     </div>`;
 
   if (isAdmin()) document.getElementById('addEventBtn').onclick = () => openAddEventModal(content, events, attendance, settings);
+  if (orphanNotice) document.getElementById('orphanBtn').onclick = () => cleanupOrphans(content);
   content.querySelectorAll('[data-open]').forEach(el => el.addEventListener('click', () => openEventDetail(el.dataset.open, content)));
   content.querySelectorAll('[data-del]').forEach(el => el.addEventListener('click', async (ev2) => {
     if (!requireToken()) return;
-    if (!confirm('이 일정과 출석기록을 삭제할까요?')) return;
+    if (!confirm('이 일정과 출석기록을 삭제할까요?\n(삭제 직전에 자동으로 백업이 만들어집니다)')) return;
     const btn = ev2.currentTarget;
     btn.disabled = true; btn.textContent = '삭제 중...';
-    const id = el.dataset.del;
-    const newEvents = events.filter(e => e.id !== id);
-    const newAttendance = attendance.filter(a => a.eventId !== id);
-    // 파일 2개를 한 번에 묶어 저장하면 저장소 전체 기준으로 충돌이 잦아지므로,
-    // 파일별로 따로(빠른 단일 파일 경로) 순서대로 저장한다.
-    const res1 = await commitFiles({ [PATHS.events]: newEvents }, `일정 삭제: ${id}`);
-    if (!res1.ok) { btn.disabled = false; btn.textContent = '삭제'; return alert('삭제 실패: ' + res1.error); }
-    const res2 = await commitFiles({ [PATHS.attendance]: newAttendance }, `일정 삭제에 따른 출석기록 정리: ${id}`);
-    if (!res2.ok) { alert('일정은 삭제됐지만 출석기록 정리는 실패했습니다: ' + res2.error + ' (다시 삭제를 시도해보세요)'); }
-    renderEvents(content, 0, { events: newEvents, attendance: newAttendance, settings });
+    await deleteEventSafely(content, el.dataset.del, btn, settings);
   }));
   const prevBtn = document.getElementById('prevPageBtn');
   const nextBtn = document.getElementById('nextPageBtn');
@@ -650,6 +875,13 @@ function openAddEventModal(content, currentEvents, currentAttendance, currentSet
   bg.querySelector('#e_end').addEventListener('change', preview);
   preview();
   bg.querySelector('#e_cancel').onclick = () => bg.remove();
+  // 등록 초안의 작업 ID는 창을 열 때 한 번만 만든다. (클릭마다 새로 만들면, 결과가 불명확했던 저장이 늦게 반영된 뒤 같은 창에서 다시 눌렀을 때 같은 일정이 새 ID로 중복 등록된다)
+  const draftId = genId('EV');
+  // 같은 작업 ID의 일정이 이미 있을 때 "같은 업무 내용인지" 비교한다. 사전 확인과 최종 저장(충돌 재시도 포함) 두 곳이 같은 함수를 쓴다.
+  // 클릭마다 달라지는 regAt, 계산값 hours는 비교하지 않는다. (업무 필드: 행사명·날짜·시작·종료)
+  const sameEvent = (a, b) => a.name === b.name && a.date === b.date && Number(a.start) === Number(b.start) && Number(a.end) === Number(b.end);
+  const alreadyMsg = (prev) => `앞서 결과가 불명확했던 저장이 이미 반영되어 있습니다: "${prev.name}" ${prev.date} ${prev.start}~${prev.end}시.\n지금 입력한 내용과 다르므로 새로 추가하지 않았습니다. 이 일정이 맞으면 창을 닫고 목록에서 확인하세요. (다른 일정을 추가하려면 창을 닫고 새로 등록하세요)`;
+  let uncertain = false;   // 직전 저장이 "결과 불명확"으로 끝났는가
   bg.querySelector('#e_save').onclick = async () => {
     const name = bg.querySelector('#e_name').value.trim();
     if (!name) return alert('행사명을 입력하세요.');
@@ -659,15 +891,29 @@ function openAddEventModal(content, currentEvents, currentAttendance, currentSet
     const saveBtn = bg.querySelector('#e_save');
     saveBtn.disabled = true; saveBtn.textContent = '저장 중...';
     const newEvent = {
-      id: genId('EV'), name, date, start, end, hours: computeHours(start, end),
+      id: draftId, name, date, start, end, hours: computeHours(start, end),
       regId: session.empId, regName: session.name, regAt: new Date().toISOString()
     };
-    const updatedEvents = [...currentEvents, newEvent];
-    const res = await commitFiles({ [PATHS.events]: updatedEvents }, `일정 등록: ${name}`);
-    if (!res.ok) { saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert('저장 실패: ' + res.error); }
+    if (uncertain) {   // 불명확했던 저장 뒤 다시 저장: 쓰기 전에 그 작업 ID가 이미 반영됐는지 최신 목록에서 먼저 확인한다
+      let latest;
+      try { latest = (await ghGetJSON(PATHS.events, [])).data; }
+      catch (e) { saveBtn.disabled = false; saveBtn.textContent = '저장 상태 확인 후 다시 저장'; return alert('저장 상태를 확인하지 못했습니다: ' + (e.message || e) + '\n같은 일정이 두 번 등록되지 않도록, 확인되기 전에는 저장하지 않습니다. 잠시 후 다시 시도하세요.'); }
+      const prev = latest.find(e => e.id === draftId);
+      if (prev) {
+        if (!sameEvent(prev, newEvent)) { saveBtn.disabled = false; saveBtn.textContent = '저장 상태 확인 후 다시 저장'; return alert(alreadyMsg(prev)); }
+        bg.remove(); return renderEvents(content, 0, { events: latest, attendance: currentAttendance, settings: currentSettings });   // 같은 내용이 이미 반영됨
+      }
+    }
+    // 최신 일정 목록에 내 일정만 추가한다. (다른 사람이 그 사이 등록한 일정은 그대로 보존)
+    const res = await mutateJSON(PATHS.events, [], (events) => {
+      const prev = events.find(e => e.id === newEvent.id);
+      if (prev) { if (sameEvent(prev, newEvent)) return null; throw new ConflictError(alreadyMsg(prev)); }   // 같은 ID: 같은 업무 내용이면 이미 저장됨, 다르면 입력을 버리지 않고 알린다(충돌 재시도로 다시 실행돼도 같은 규칙)
+      return { data: [...events, newEvent] };
+    }, `일정 등록: ${name}`);
+    if (!res.ok && res.itemConflict) { uncertain = true; saveBtn.disabled = false; saveBtn.textContent = '저장 상태 확인 후 다시 저장'; return alert(res.error); }   // 불일치: 창을 유지하고 입력·반영된 내용을 보여 준다
+    if (!res.ok) { if (res.unknown) uncertain = true; saveBtn.disabled = false; saveBtn.textContent = uncertain ? '저장 상태 확인 후 다시 저장' : '저장'; return alert((res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ') + res.error + (res.unknown ? '\n(같은 창에서 다시 저장하면 먼저 반영 여부를 확인합니다)' : '\n(저장되지 않았습니다)')); }
     bg.remove();
-    // events.json만 바뀌었으므로 attendance/settings는 이미 있던 값을 그대로 재사용 (추가 조회 없음)
-    renderEvents(content, 0, { events: updatedEvents, attendance: currentAttendance, settings: currentSettings });
+    renderEvents(content, 0, { events: res.data, attendance: currentAttendance, settings: currentSettings });
   };
 }
 
@@ -702,36 +948,59 @@ async function openEventDetail(id, content) {
     busyBtn.disabled = true;
     busyBtn.textContent = busyLabel;
     resDiv.textContent = '';
-    const [members, freshAttendance] = await Promise.all([readJSON(PATHS.members, [], 300000), readJSON(PATHS.attendance, [])]);
-    attendance = freshAttendance;
+    const finish = () => { busyBtn.disabled = false; busyBtn.textContent = idleLabel; };
+    let members;
+    try { members = await readJSON(PATHS.members, [], 300000); }   // 명단은 대조용이라 5분까지 재사용
+    catch (err) { finish(); resDiv.textContent = '명단을 읽지 못했습니다: ' + (err.message || err); return; }
     const memberMap = new Map(members.map(m => [String(m.empId).trim().toUpperCase(), m]));
-    const existingSet = new Set(attendance.filter(a => a.eventId === id).map(a => String(a.empId).trim().toUpperCase()));
-    let matched = 0, duplicated = 0;
     const unmatched = [];
-    const newRecords = [];
+    const candidates = [];
+    const seenInput = new Set();
+    let duplicatedInput = 0;
     empIds.forEach(rawId => {
       const key = String(rawId).trim().toUpperCase();
       if (!key) return;
-      if (existingSet.has(key)) { duplicated++; return; }
+      if (seenInput.has(key)) { duplicatedInput++; return; }
+      seenInput.add(key);
       const m = memberMap.get(key);
       if (!m) { unmatched.push(rawId); return; }
-      newRecords.push({ id: genId('AT'), eventId: id, empId: m.empId, name: m.name, at: new Date().toISOString() });
-      existingSet.add(key);
-      matched++;
+      candidates.push(m);
     });
-    if (newRecords.length === 0) {
+    try {
+      const evNow = await ghGetJSON(PATHS.events, []);
+      if (!evNow.data.some(e => e.id === id)) { finish(); resDiv.textContent = '이 일정은 그 사이 다른 사용자가 삭제했습니다. 출석자를 추가하지 않았습니다.'; return; }
+    } catch (err) { finish(); resDiv.textContent = '일정 확인에 실패했습니다: ' + (err.message || err); return; }
+    let added = 0, dupExisting = 0;
+    let res;
+    try {
+      res = candidates.length === 0 ? { ok: true, unchanged: true } : await mutateJSON(PATHS.attendance, [], (att) => {
+        // 최신 출석기록을 기준으로 이미 있는 사람은 건너뛰고 새 사람만 덧붙인다. (다른 사람이 그 사이 넣은 기록은 보존)
+        const existing = new Set(att.filter(a => a.eventId === id).map(a => String(a.empId).trim().toUpperCase()));
+        const recs = [];
+        dupExisting = 0;
+        candidates.forEach(m => {
+          const k = String(m.empId).trim().toUpperCase();
+          if (existing.has(k)) { dupExisting++; return; }
+          existing.add(k);
+          recs.push({ id: genId('AT'), eventId: id, empId: m.empId, name: m.name, at: new Date().toISOString() });
+        });
+        added = recs.length;
+        if (recs.length === 0) return null;
+        return { data: [...att, ...recs], result: { added } };
+      }, (r) => `출석자 추가: ${id} (+${r.added}명)`);
+    } catch (err) { finish(); resDiv.textContent = '저장 실패: ' + (err.message || err); return; }
+    finish();
+    if (!res.ok) { resDiv.textContent = (res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ') + res.error + (res.unknown ? '' : ' (저장되지 않았습니다)'); return; }
+    const duplicated = duplicatedInput + dupExisting;
+    if (res.unchanged) {
+      if (res.data) attendance = res.data;
       resDiv.textContent = `추가된 인원 없음 (중복 ${duplicated}건, 미매칭 ${unmatched.length}건)`;
-      busyBtn.disabled = false; busyBtn.textContent = idleLabel;
       return;
     }
-    const updatedAttendance = [...attendance, ...newRecords];
-    const res = await commitFiles({ [PATHS.attendance]: updatedAttendance }, `출석자 추가: ${id} (+${matched}명)`);
-    busyBtn.disabled = false; busyBtn.textContent = idleLabel;
-    if (!res.ok) { resDiv.textContent = '저장 실패: ' + res.error; return; }
-    attendance = updatedAttendance;
+    attendance = res.data;
     count = attendance.filter(a => a.eventId === id).length;
     bg.querySelector('#e_meta').textContent = ev ? `${ev.date} · ${fmtHour(ev.start)}~${fmtHour(ev.end)} · ${ev.hours}시간 · 참석 ${count}명` : '';
-    resDiv.innerHTML = `매칭 ${matched}명 등록${duplicated ? `, 중복 ${duplicated}건 제외` : ''}${unmatched.length ? `, 명단에 없는 사번 ${unmatched.length}건: ${esc(unmatched.join(', '))}` : ''}`;
+    resDiv.innerHTML = `매칭 ${added}명 등록${duplicated ? `, 중복 ${duplicated}건 제외` : ''}${unmatched.length ? `, 명단에 없는 사번 ${unmatched.length}건: ${esc(unmatched.join(', '))}` : ''}`;
   }
 
   bg.querySelector('#manualAddBtn').onclick = async () => {
@@ -750,12 +1019,17 @@ async function openEventDetail(id, content) {
   bg.querySelector('#attFile').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    const buf = await file.arrayBuffer();
-    const wb = XLSX.read(buf, { type: 'array' });
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
-    const empIds = rows.map(r => String(r[0] || '').trim()).filter(Boolean);
+    const rows = await readSheetRows(file);
+    if (!rows) { e.target.value = ''; return; }
+    const empIds = [], skippedIds = [];
+    rows.forEach((r, i) => {
+      const s = String(r[0] || '').trim();
+      if (!s) return;
+      const risk = rows.cellRisk ? rows.cellRisk(i, 0) : null;
+      if (risk) skippedIds.push(`${rows.rowNo(i)}행(${s}): ${risk}`); else empIds.push(s);
+    });
     await applyNewAttendees(empIds, bg.querySelector('#uploadResult'), bg.querySelector('#attUploadBtn'), '⏳ 업로드 처리 중...', '📤 참석자 명단 업로드 (사번 목록 엑셀)');
+    if (skippedIds.length) { const rd = bg.querySelector('#uploadResult'); rd.textContent = (rd.textContent ? rd.textContent + ' · ' : '') + `사번을 확인할 수 없어 제외 ${skippedIds.length}건 — ` + skippedIds.slice(0, 3).join(' / ') + (skippedIds.length > 3 ? ` 외 ${skippedIds.length - 3}건` : '') + ' (엑셀 사번 칸을 텍스트 서식으로 고쳐 다시 올려 주세요)'; }
     e.target.value = '';
   });
 }
@@ -1068,11 +1342,17 @@ async function renderMembers(content, offset = 0, q = '', presetAll = null) {
   }));
   wrap.querySelectorAll('[data-del]').forEach(el => el.addEventListener('click', async () => {
     if (!requireToken()) return;
-    if (!confirm('이 조합원을 삭제할까요?')) return;
-    const newList = all.filter(m => String(m.empId).trim().toUpperCase() !== el.dataset.del.toUpperCase());
-    const res = await commitFiles({ [PATHS.members]: newList }, `조합원 삭제: ${el.dataset.del}`);
-    if (!res.ok) return alert('삭제 실패: ' + res.error);
-    renderMembers(content, offset, q, newList);
+    if (!confirm('이 조합원을 삭제할까요?\n(삭제 직전에 이 조합원 정보가 자동으로 백업됩니다)')) return;
+    const delKey = el.dataset.del.toUpperCase();
+    const base = all.find(m => memKey(m) === delKey);   // 화면에서 보던 시점의 정보
+    const res = await mutateJSON(PATHS.members, [], (list) => {
+      const idx = list.findIndex(m => memKey(m) === delKey);
+      if (idx < 0) return null; // 이미 삭제됨
+      if (base && !sameMember(list[idx], base)) throw new ConflictError('삭제하려는 조합원 정보가 그 사이 다른 사용자에 의해 수정되었습니다. 목록을 새로 불러온 뒤 확인하고 다시 삭제하세요. (삭제하지 않았습니다)');
+      return { data: list.filter((m, i) => i !== idx), result: { removed: list[idx] } };
+    }, `조합원 삭제: ${el.dataset.del}`, { beforeWrite: async (latest, next, result) => { await writeBackup('member-deleted', { member: result.removed }); } });
+    if (!res.ok) { alert((res.backupFailed ? '백업에 실패해 삭제하지 않았습니다: ' : (res.unknown ? '삭제 결과 확인 필요: ' : '삭제 실패: ')) + res.error); if (res.itemConflict) renderMembers(content, offset, q); return; }
+    renderMembers(content, offset, q, res.data);
   }));
   const moreBtn = document.getElementById('mMoreBtn');
   if (moreBtn) moreBtn.onclick = () => renderMembers(content, offset + 50, q, all);
@@ -1136,110 +1416,30 @@ function openMemberModal(m, currentAll, content, offset, q) {
   bg.querySelector('#mm_save').onclick = async () => {
     const saveBtn = bg.querySelector('#mm_save');
     saveBtn.disabled = true; saveBtn.textContent = '저장 중...';
-    const all = [...currentAll];
-    const idx = all.findIndex(x => String(x.empId).trim().toUpperCase() === String(m.empId).trim().toUpperCase());
     const updated = {
       group: bg.querySelector('#mm_group').value, empId: m.empId, name: bg.querySelector('#mm_name').value,
       dept: bg.querySelector('#mm_dept').value, phone: bg.querySelector('#mm_phone').value,
       bank: bg.querySelector('#mm_bank').value, account: bg.querySelector('#mm_account').value,
       holder: bg.querySelector('#mm_holder').value
     };
-    if (idx >= 0) all[idx] = updated; else all.push(updated);
-    const res = await commitFiles({ [PATHS.members]: all }, `조합원 정보 수정: ${m.empId}`);
-    if (!res.ok) { saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert('저장 실패: ' + res.error); }
+    // 최신 명단에서 이 조합원만 바꾼다. 그 사이 다른 사람이 이 조합원을 바꿨다면 덮어쓰지 않고 중단한다.
+    const res = await mutateJSON(PATHS.members, [], (list) => {
+      const idx = list.findIndex(x => memKey(x) === memKey(m));
+      if (idx < 0) throw new ConflictError('이 조합원이 그 사이 삭제되었습니다. 목록을 새로 불러와 확인해 주세요. (저장하지 않았습니다)');
+      if (sameMember(list[idx], updated)) return null; // 이미 같은 내용
+      if (!sameMember(list[idx], m)) throw new ConflictError('다른 사용자가 이 조합원 정보를 먼저 수정했습니다. 최신 내용을 확인한 뒤 다시 수정해 주세요. (덮어쓰지 않았습니다)');
+      list[idx] = { ...list[idx], ...updated };
+      return { data: list };
+    }, `조합원 정보 수정: ${m.empId}`);
+    if (!res.ok) {
+      if (res.itemConflict) { bg.remove(); alert(res.error); return renderMembers(content, offset, q); }
+      saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert((res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ') + res.error + (res.unknown ? '' : '\n(저장되지 않았습니다)'));
+    }
     bg.remove();
-    renderMembers(content, offset, q, all);
+    renderMembers(content, offset, q, res.data);
   };
 }
 
-async function handleReplaceMembers(content, e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  if (!confirm('현재 조합원 명단 전체를 이 파일 내용으로 교체합니다. 계속할까요?')) { e.target.value = ''; return; }
-  const btn = document.getElementById('replaceBtn');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ 처리 중...'; }
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: 'array' });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
-  const hIdx = raw.findIndex(r => r.includes('사번'));
-  const headers = hIdx >= 0 ? raw[hIdx] : ['지단', '사번', '성명', '소속', '전화번호', '은행', '계좌번호'];
-  const start = hIdx >= 0 ? hIdx + 1 : 0;
-  const col = (n) => headers.indexOf(n);
-  const rows = [];
-  for (let i = start; i < raw.length; i++) {
-    const r = raw[i];
-    if (!r || r.every(c => String(c).trim() === '')) continue;
-    const empId = String(r[col('사번')] ?? '').trim();
-    if (!empId) continue;
-    rows.push({
-      group: r[col('지단')] ?? '', empId, name: r[col('성명')] ?? '', dept: r[col('소속')] ?? '',
-      phone: r[col('전화번호')] ?? '', bank: r[col('은행')] ?? '', account: r[col('계좌번호')] ?? ''
-    });
-  }
-  const res = await commitFiles({ [PATHS.members]: rows }, `조합원 명단 교체 (${rows.length}명)`);
-  e.target.value = '';
-  if (res.ok) { alert(`${rows.length.toLocaleString()}명으로 교체 완료`); renderMembers(content, 0, '', rows); }
-  else { if (btn) { btn.disabled = false; btn.textContent = '명단 교체 등록'; } alert('교체 실패: ' + res.error); }
-}
-
-async function handleBankUpdate(content, e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const btn = document.getElementById('bankUpdateBtn');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ 처리 중...'; }
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: 'array' });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
-
-  const hIdx = raw.findIndex(r => r.includes('사번'));
-  let idIdx, bankIdx, accountIdx, holderIdx, start;
-  if (hIdx >= 0) {
-    const headers = raw[hIdx];
-    idIdx = headers.indexOf('사번');
-    bankIdx = headers.indexOf('은행');
-    accountIdx = headers.indexOf('계좌번호');
-    holderIdx = headers.indexOf('예금주');
-    start = hIdx + 1;
-  } else {
-    idIdx = 0; bankIdx = 1; accountIdx = 2; holderIdx = 3; start = 0; // 헤더가 없으면 사번,은행,계좌번호,예금주 순서로 간주
-  }
-
-  const updates = [];
-  for (let i = start; i < raw.length; i++) {
-    const r = raw[i];
-    if (!r || r.every(c => String(c).trim() === '')) continue;
-    const empId = String(r[idIdx] ?? '').trim();
-    if (!empId) continue;
-    updates.push({
-      empId,
-      bank: bankIdx >= 0 ? String(r[bankIdx] ?? '').trim() : '',
-      account: accountIdx >= 0 ? String(r[accountIdx] ?? '').trim() : '',
-      holder: holderIdx >= 0 ? String(r[holderIdx] ?? '').trim() : ''
-    });
-  }
-
-  const all = await readJSON(PATHS.members, []);
-  const indexMap = new Map(all.map((m, i) => [String(m.empId).trim().toUpperCase(), i]));
-  let matched = 0;
-  const unmatched = [];
-  updates.forEach(u => {
-    const idx = indexMap.get(u.empId.toUpperCase());
-    if (idx === undefined) { unmatched.push(u.empId); return; }
-    if (u.bank) all[idx].bank = u.bank;
-    if (u.account) all[idx].account = u.account;
-    if (u.holder) all[idx].holder = u.holder;
-    matched++;
-  });
-
-  const res = await commitFiles({ [PATHS.members]: all }, `계좌정보 일괄 등록 (${matched}명)`);
-  e.target.value = '';
-  if (btn) { btn.disabled = false; btn.textContent = '계좌정보 일괄 등록'; }
-  if (!res.ok) return alert('저장 실패: ' + res.error);
-  alert(`계좌정보 ${matched}명 업데이트 완료${unmatched.length ? `\n명단에 없는 사번 ${unmatched.length}건: ${unmatched.join(', ')}` : ''}`);
-  renderMembers(content, 0, '', all);
-}
 
 // ============================================================
 // 사용자 설정 (+ GitHub 연결)
@@ -1279,16 +1479,34 @@ async function renderUsers(content, preset = null) {
             <td class="row-flex"><button class="icon ghost" data-edit="${esc(u.empId)}">수정</button><button class="icon danger" data-del="${esc(u.empId)}">삭제</button></td></tr>`).join('')}</tbody>
         </table>
       </div>
+    </div>
+    <div class="card" id="backupCard">
+      <div style="font-weight:700; font-size:15px; margin-bottom:2px;">백업·복구</div>
+      <div style="font-size:12.5px; color:#888; margin-bottom:12px;">명단 교체·계좌정보 일괄 등록·일정 삭제·조합원 삭제 직전에는 자동으로 백업이 만들어집니다. 사용자 계정 정보(비밀번호 포함)는 백업에 넣지 않습니다.</div>
+      <div class="row-flex" style="flex-wrap:wrap;">
+        <button class="ghost" id="bkDownloadAll">현재 전체 데이터 내려받기</button>
+        <button class="ghost" id="bkRefresh">자동 백업 목록 보기</button>
+        <button class="ghost" id="bkRestoreFile">백업 파일로 복원…</button>
+        <input type="file" id="bkFile" accept=".json" style="display:none" />
+      </div>
+      <div id="bkList" style="margin-top:12px;"></div>
+      <div style="font-size:11.5px; color:#aaa; margin-top:10px;">화면 버전 ${esc(APP_VERSION)} · 엑셀 라이브러리 ${esc(typeof XLSX !== 'undefined' && XLSX.version ? XLSX.version : '불러오지 못함')}</div>
     </div>`;
 
   document.getElementById('tokenBtn').onclick = () => openTokenModal(() => renderUsers(content, { users, settings }));
   document.getElementById('rateSaveBtn').onclick = async () => {
     if (!requireToken()) return;
-    const newSettings = { rate: Number(document.getElementById('rateInput').value) };
-    const res = await commitFiles({ [PATHS.settings]: newSettings }, '시간당 지급액 변경');
-    if (!res.ok) return alert('저장 실패: ' + res.error);
+    const newRate = Number(document.getElementById('rateInput').value);
+    if (!Number.isFinite(newRate) || newRate < 0) return alert('시간당 지급액을 올바른 숫자로 입력하세요.');
+    const baseRate = Number(settings.rate);   // 화면에서 보던 시점의 값
+    const res = await mutateJSON(PATHS.settings, { rate: 15000 }, (cur) => {
+      if (Number(cur.rate) === newRate) return null;
+      if (Number(cur.rate) !== baseRate) throw new ConflictError(`다른 사용자가 지급액을 먼저 ${Number(cur.rate).toLocaleString()}원으로 바꿨습니다. 화면을 새로 불러와 확인한 뒤 다시 저장하세요. (덮어쓰지 않았습니다)`);
+      return { data: { ...cur, rate: newRate } };
+    }, '시간당 지급액 변경');
+    if (!res.ok) { alert((res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ') + res.error); if (res.itemConflict) renderUsers(content); return; }
     alert('저장되었습니다.');
-    renderUsers(content, { users, settings: newSettings });
+    renderUsers(content, { users, settings: res.data });
   };
   document.getElementById('addUserBtn').onclick = () => { if (requireToken()) openAddUserModal(content, users, settings); };
   content.querySelectorAll('[data-edit]').forEach(el => el.addEventListener('click', () => {
@@ -1299,11 +1517,17 @@ async function renderUsers(content, preset = null) {
     if (!requireToken()) return;
     if (el.dataset.del === session.empId) return alert('본인 계정은 삭제할 수 없습니다.');
     if (!confirm('이 사용자를 삭제할까요?')) return;
-    const newUsers = users.filter(u => u.empId !== el.dataset.del);
-    const res = await commitFiles({ [PATHS.users]: newUsers }, `사용자 삭제: ${el.dataset.del}`);
-    if (!res.ok) return alert('삭제 실패: ' + res.error);
-    renderUsers(content, { users: newUsers, settings });
+    const base = users.find(u => u.empId === el.dataset.del);
+    const res = await mutateJSON(PATHS.users, [], (list) => {
+      const idx = list.findIndex(u => u.empId === el.dataset.del);
+      if (idx < 0) return null; // 이미 삭제됨
+      if (base && !sameUser(list[idx], base)) throw new ConflictError('삭제하려는 사용자 정보가 그 사이 수정되었습니다. 화면을 새로 불러와 확인한 뒤 다시 삭제하세요. (삭제하지 않았습니다)');
+      return { data: list.filter((u, i) => i !== idx) };
+    }, `사용자 삭제: ${el.dataset.del}`);
+    if (!res.ok) { alert((res.unknown ? '삭제 결과 확인 필요: ' : '삭제 실패: ') + res.error); if (res.itemConflict) renderUsers(content); return; }
+    renderUsers(content, { users: res.data, settings });
   }));
+  wireBackupCard();
 }
 
 function openEditUserModal(content, currentUsers, currentSettings, u) {
@@ -1341,8 +1565,10 @@ function openEditUserModal(content, currentUsers, currentSettings, u) {
     }
     const saveBtn = bg.querySelector('#eu_save');
     saveBtn.disabled = true; saveBtn.textContent = '저장 중...';
-    const newUsers = currentUsers.map(x => {
-      if (x.empId !== u.empId) return x;
+    const res = await mutateJSON(PATHS.users, [], (list) => {
+      const idx = list.findIndex(x => x.empId === u.empId);
+      if (idx < 0) throw new ConflictError('이 사용자가 그 사이 삭제되었습니다. 화면을 새로 불러와 확인해 주세요. (저장하지 않았습니다)');
+      const x = list[idx];
       const updated = {
         ...x,
         name: bg.querySelector('#eu_name').value.trim() || x.name,
@@ -1350,12 +1576,17 @@ function openEditUserModal(content, currentUsers, currentSettings, u) {
         status: bg.querySelector('#eu_status').value
       };
       if (bg.querySelector('#eu_resetpw').checked) updated.password = x.empId;
-      return updated;
-    });
-    const res = await commitFiles({ [PATHS.users]: newUsers }, `사용자 수정: ${u.empId}`);
-    if (!res.ok) { saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert('저장 실패: ' + res.error); }
+      if (sameUser(x, updated)) return null; // 이미 같은 내용
+      if (!sameUser(x, u)) throw new ConflictError('다른 사용자가 이 사용자 정보를 먼저 수정했습니다. 화면을 새로 불러와 확인한 뒤 다시 수정하세요. (덮어쓰지 않았습니다)');
+      list[idx] = updated;
+      return { data: list };
+    }, `사용자 수정: ${u.empId}`);
+    if (!res.ok) {
+      if (res.itemConflict) { bg.remove(); alert(res.error); return renderUsers(content); }
+      saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert((res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ') + res.error + (res.unknown ? '' : '\n(저장되지 않았습니다)'));
+    }
     bg.remove();
-    renderUsers(content, { users: newUsers, settings: currentSettings });
+    renderUsers(content, { users: res.data, settings: currentSettings });
   };
 }
 
@@ -1390,7 +1621,7 @@ function openAddUserModal(content, currentUsers, currentSettings) {
       <h3 style="margin-top:0;">사용자 추가</h3>
       <label>사번</label><input id="u_id" />
       <label>이름</label><input id="u_name" />
-      <label>권한</label><select id="u_role"><option>관리자</option><option>일반</option></select>
+      <label>권한</label><select id="u_role"><option>일반</option><option>관리자</option></select>
       <div class="notice">최초 비밀번호는 사번과 동일하게 설정됩니다.</div>
       <div class="actions">
         <button class="ghost" id="u_cancel">취소</button>
@@ -1406,13 +1637,832 @@ function openAddUserModal(content, currentUsers, currentSettings) {
     if (currentUsers.some(u => u.empId === empId)) return alert('이미 등록된 사번입니다.');
     const saveBtn = bg.querySelector('#u_save');
     saveBtn.disabled = true; saveBtn.textContent = '저장 중...';
-    const newUsers = [...currentUsers, { empId, name, password: empId, role: bg.querySelector('#u_role').value, status: '사용' }];
-    const res = await commitFiles({ [PATHS.users]: newUsers }, `사용자 추가: ${empId}`);
-    if (!res.ok) { saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert('저장 실패: ' + res.error); }
+    const newUser = { empId, name, password: empId, role: bg.querySelector('#u_role').value, status: '사용' };
+    const res = await mutateJSON(PATHS.users, [], (list) => {
+      if (list.some(x => x.empId === empId)) throw new ConflictError('다른 사용자가 같은 사번을 먼저 등록했습니다. 화면을 새로 불러와 확인하세요. (저장하지 않았습니다)');
+      return { data: [...list, newUser] };
+    }, `사용자 추가: ${empId}`);
+    if (!res.ok) {
+      if (res.itemConflict) { bg.remove(); alert(res.error); return renderUsers(content); }
+      saveBtn.disabled = false; saveBtn.textContent = '저장'; return alert((res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ') + res.error + (res.unknown ? '' : '\n(저장되지 않았습니다)'));
+    }
     bg.remove();
-    renderUsers(content, { users: newUsers, settings: currentSettings });
+    renderUsers(content, { users: res.data, settings: currentSettings });
   };
 }
+// ============================================================
+// 백업·복구
+//  - 명단 교체 / 계좌정보 일괄 등록 / 일정 삭제 / 조합원 삭제 직전에 자동으로 백업 파일을 만든다. (data/backup/)
+//  - 백업 파일은 내려받을 수 있고, 복원할 수 있다. 복원 뒤에는 다시 읽어 건수와 주요 필드가 백업과 같은지 검사한다.
+//  - 사용자 계정 정보(비밀번호 포함)는 백업에 넣지 않는다.
+// ============================================================
+const APP_VERSION = 'v2.8 · 2026-10-30 (병행 배포 확인 단계)';
+const BACKUP_DIR = 'data/backup';
+const BACKUP_LABELS = {
+  'members-before-replace': '명단 교체 직전 명단 전체',
+  'members-before-bank-update': '계좌정보 일괄 등록 직전 명단 전체',
+  'member-deleted': '삭제한 조합원 1명',
+  'event-deleted': '삭제한 일정과 그 출석기록',
+  'full-before-restore': '복원 직전 데이터',
+  'orphan-attendance': '정리한 잔여 출석기록',
+  'full': '전체 데이터(내려받은 백업)'
+};
+
+function backupStamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+// 저장 직전에 호출한다. 실패하면 오류를 던진다 → 호출한 작업은 저장 없이 중단된다.
+async function writeBackup(kind, payload, note = '') {
+  const record = { app: 'strike-attendance', version: 1, kind, createdAt: new Date().toISOString(), createdBy: session ? `${session.empId} ${session.name}` : '', note, data: payload };
+  const path = `${BACKUP_DIR}/${backupStamp()}-${kind}-${Math.random().toString(36).slice(2, 6)}.json`;
+  const put = await ghPutJSON(path, record, `백업: ${BACKUP_LABELS[kind] || kind}`);
+  if (!put.ok) throw new Error('백업을 저장하지 못했습니다: ' + put.error);
+  return path;
+}
+
+async function listBackups() {
+  const res = await fetch(ghUrl(BACKUP_DIR), { headers: ghHeaders(), cache: 'no-store' });
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`백업 목록 읽기 실패 (${res.status})`);
+  const list = await res.json();
+  return (Array.isArray(list) ? list : []).filter(x => x.type === 'file' && /\.json$/.test(x.name)).map(x => {
+    const m = x.name.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-(.+)-[a-z0-9]+\.json$/);
+    const kb = (x.size || 0) / 1024;
+    return {
+      name: x.name, path: x.path,
+      when: m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}` : '',
+      label: m ? (BACKUP_LABELS[m[7]] || m[7]) : x.name,
+      sizeText: kb >= 1024 ? `${(kb / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(kb))}KB`
+    };
+  }).sort((a, b) => b.name.localeCompare(a.name));
+}
+
+function downloadJSON(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function readAllDataFresh() {
+  const [members, events, attendance, settings] = await Promise.all([
+    ghGetJSON(PATHS.members, []), ghGetJSON(PATHS.events, []), ghGetJSON(PATHS.attendance, []), ghGetJSON(PATHS.settings, { rate: 15000 })
+  ]);
+  return {
+    members: members.data, events: events.data, attendance: attendance.data, settings: settings.data,
+    _sha: { members: members.sha, events: events.sha, attendance: attendance.sha, settings: settings.sha }   // 읽은 시점의 파일 식별값(다른 사용자의 변경 감지용)
+  };
+}
+
+// ---------- 명단 교체 ----------
+// 규칙: 엑셀에 값이 있으면 그 값으로 갱신 / 열이 없거나 칸이 비어 있으면 기존 값 유지(빈칸으로 지우지 않음).
+//       파일에 없는 사람은 dropMissing일 때만 명단에서 제외. 파일에 같은 사번이 여러 번이면 첫 행만 사용.
+function planMemberReplace(current, rows, dropMissing) {
+  const curMap = new Map(current.map(m => [memKey(m), m]));
+  const seen = new Set();
+  const next = [], added = [], changed = [], unchanged = [];
+  let bankKept = 0, dupRows = 0;
+  rows.forEach(r => {
+    const k = memKey(r);
+    if (!k) return;
+    if (seen.has(k)) { dupRows++; return; }
+    seen.add(k);
+    const old = curMap.get(k);
+    if (!old) {
+      const item = { group: r.group || '', empId: r.empId, name: r.name || '', dept: r.dept || '', phone: r.phone || '', bank: r.bank || '', account: r.account || '', holder: r.holder || '' };
+      next.push(item); added.push(item); return;
+    }
+    const merged = { ...old };
+    let diff = false;
+    MEMBER_FIELDS.forEach(f => { const v = norm(r[f]); if (v !== '' && v !== norm(old[f])) { merged[f] = v; diff = true; } });
+    if (['bank', 'account', 'holder'].some(f => norm(old[f]) !== '' && norm(r[f]) === '')) bankKept++;
+    next.push(merged);
+    (diff ? changed : unchanged).push(merged);
+  });
+  const missing = current.filter(m => !seen.has(memKey(m)));
+  if (!dropMissing) missing.forEach(m => next.push(m));
+  return { next, added, changed, unchanged, removed: dropMissing ? missing : [], keptMissing: dropMissing ? [] : missing, bankKept, dupRows };
+}
+
+const ACCT_HELP = '숫자로 저장된 계좌번호는 칸 서식만 "텍스트"로 바꿔도 이미 사라진 앞자리 0이나 자릿수가 복구되지 않습니다. 원본에서 계좌번호를 텍스트로 다시 입력(또는 CSV를 가져올 때 텍스트 열로 지정)해 올려 주세요.';
+
+// 명단 교체: 계좌번호 오류 행의 은행·계좌·예금주는 저장하지 않으므로, "저장 뒤에도 계좌가 비어 있는 사람"을 최신 명단 기준으로 구분한다.
+// 이 구분은 저장하는 데이터가 아니라 화면용이며, 명단이 바뀔 때마다(미리보기 갱신·저장 직전) 현재 명단으로 다시 계산한다.
+function classifyAcctIssues(rows, members) {
+  const byId = new Map(members.map(m => [memKey(m), m]));
+  const seen = new Set(), out = [];
+  rows.forEach(r => {
+    const k = memKey(r);
+    if (!k || seen.has(k)) return; seen.add(k);   // 명단 교체는 같은 사번의 첫 행만 쓴다
+    if (!r._acctBad) return;
+    const old = byId.get(k), kind = String(r._acctBad.reason).split(' — ')[0];
+    const base = { empId: r.empId, name: r.name || (old && old.name) || '', rowNo: r._acctBad.rowNo, kind };
+    if (!old) out.push({ ...base, type: '신규', status: '계좌정보 확인 필요', need: true, why: '신규 조합원: 엑셀 계좌번호 칸을 저장하지 않아 계좌정보가 비어 있음' });
+    else if (norm(old.account) !== '') out.push({ ...base, type: '기존', status: '기존 값 유지', need: false, why: '기존 조합원: 엑셀 계좌번호 칸을 저장하지 않고 기존 은행·계좌·예금주를 유지' });
+    else out.push({ ...base, type: '기존', status: '계좌정보 확인 필요', need: true, why: '기존 조합원: 기존에도 계좌정보가 없고 엑셀 계좌번호 칸을 저장하지 않아 비어 있음' });
+  });
+  return out;
+}
+
+const ACCT_PRIVACY = '이 파일에는 조합원의 사번·이름이 들어 있는 개인정보입니다(계좌번호는 들어 있지 않습니다). 안전한 곳에 보관하고 사용 후 삭제하세요.';
+function downloadAcctCheckList(cls) {
+  const need = cls.filter(x => x.need);
+  if (need.length === 0) return alert('확인 필요 인원이 없습니다.');
+  const rows = [['사번', '이름', '신규/기존 구분', '확인 필요 사유'], ...need.map(x => [String(x.empId), String(x.name), x.type, `${x.why} (${x.kind})`])];
+  dxExcel(`계좌정보_확인필요_목록-${backupStamp()}.xlsx`, [['확인 필요 목록', rows], ['안내', [['이 파일에는 조합원의 사번·이름이 들어 있는 개인정보입니다.'], ['계좌번호는 이 목록에 포함하지 않았습니다.'], ['안전한 곳에 보관하고, 사용이 끝나면 삭제하세요.']]]]);
+}
+
+// 미리보기용: 계좌번호 오류 행 안내 + 확인 필요 인원 구분
+function acctSectionHtml(cls, badRows) {
+  if (!badRows) return '';
+  const need = cls.filter(x => x.need), keep = cls.filter(x => !x.need);
+  const line = (x) => `엑셀 ${x.rowNo}행 · ${esc(x.empId)} ${esc(x.name)} · [${x.type}] <b>${x.status}</b> · ${esc(x.kind)}`;
+  const list = cls.slice(0, 10).map(line).join('<br/>') + (cls.length > 10 ? `<br/>외 ${cls.length - 10}명` : '');
+  return `<div class="notice" style="background:#fdeaea; color:#c62828;"><b>계좌번호를 확인할 수 없는 행 ${badRows}개 — 이 행의 은행·계좌번호·예금주는 저장하지 않습니다.</b><br/>
+    <b>계좌정보 확인 필요 ${need.length}명</b>(신규 ${need.filter(x => x.type === '신규').length} · 기존 ${need.filter(x => x.type === '기존').length}) · <b>기존 값 유지 ${keep.length}명</b><br/>${list}<br/>${esc(ACCT_HELP)}
+    ${need.length ? `<br/><button class="ghost" id="rp_dl" type="button" style="margin-top:6px;">확인 필요 목록 내려받기</button> <span style="font-size:12px;">${esc(ACCT_PRIVACY)}</span>` : ''}</div>`;
+}
+
+// 교체 완료 뒤: 최신 명단 기준으로 계산한 확인 필요 인원을 보여주고 내려받게 한다.
+function showAcctDoneModal(cls, fileName) {
+  const need = cls.filter(x => x.need), keep = cls.filter(x => !x.need);
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `
+    <div class="modal" style="width:640px; max-height:86vh; overflow:auto;">
+      <h3 style="margin-top:0;">명단 교체 결과: 계좌정보 확인 필요</h3>
+      <div style="font-size:12.5px; color:#888; margin-bottom:8px;">파일: ${esc(fileName)} · 아래는 저장 직전의 최신 명단 기준으로 계산했습니다.</div>
+      <p><b>계좌정보 확인 필요 ${need.length}명</b>(신규 ${need.filter(x => x.type === '신규').length} · 기존 ${need.filter(x => x.type === '기존').length}) · <b>기존 값 유지 ${keep.length}명</b></p>
+      <table style="font-size:12.5px;"><thead><tr><th>구분</th><th>사번</th><th>이름</th><th>상태</th><th>사유</th></tr></thead>
+        <tbody>${cls.map(x => `<tr><td>${x.type}</td><td>${esc(x.empId)}</td><td>${esc(x.name)}</td><td>${x.need ? '<b style="color:#c62828;">' + x.status + '</b>' : x.status}</td><td>${esc(x.kind)}</td></tr>`).join('')}</tbody></table>
+      <div class="notice">${esc(ACCT_HELP)}</div>
+      ${need.length ? `<div class="notice">${esc(ACCT_PRIVACY)}</div>` : ''}
+      <div class="actions">
+        ${need.length ? '<button class="ghost" id="ad_dl">확인 필요 목록 내려받기</button>' : ''}
+        <button class="primary" id="ad_close">닫기</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bg);
+  const dl = bg.querySelector('#ad_dl'); if (dl) dl.onclick = () => downloadAcctCheckList(cls);
+  bg.querySelector('#ad_close').onclick = () => bg.remove();
+}
+
+// 전화번호 형식 이상 여부 (경고만 하고 값은 바꾸지 않는다)
+function phoneOddReason(s) {
+  const t = String(s || '').trim();
+  if (!t) return '';
+  const d = t.replace(/[\s\-().]/g, '');
+  if (/[^0-9+]/.test(d)) return '숫자·하이픈 외 글자가 섞여 있음';
+  const digits = d.replace(/^\+82/, '0');
+  if (/^01[016789]\d{7,8}$/.test(digits)) return '';
+  if (/^0(2|[3-6][1-5]|70|80)\d{7,8}$/.test(digits)) return '';
+  if (/^1[016789]\d{7,8}$/.test(digits)) return '앞자리 0이 빠진 것으로 보임(엑셀 숫자 칸)';
+  if (digits.length < 9) return '자릿수가 너무 짧음';
+  if (digits.length > 11) return '자릿수가 너무 김';
+  return '일반적인 전화번호 형식이 아님';
+}
+
+// 파일의 확인 필요 항목을 미리보기에 보여주는 안내 상자
+function fileIssuesHtml(iss) {
+  const list = (arr, n = 8) => arr.slice(0, n).map(x => `엑셀 ${x.rowNo}행 · ${esc(x.shown || '(빈 칸)')} · ${esc(x.reason)}`).join('<br/>') + (arr.length > n ? `<br/>외 ${arr.length - n}건` : '');
+  const red = 'background:#fdeaea; color:#c62828;', amber = 'background:#fff3d6; color:#8a5a00;';
+  let h = '';
+  if (iss.idBad && iss.idBad.length) h += `<div class="notice" style="${red}"><b>사번을 확인할 수 없는 행 ${iss.idBad.length}개 — 이 상태로는 교체할 수 없습니다.</b><br/>${list(iss.idBad)}<br/>이 인원이 '엑셀에 없는 인원'으로 처리되어 명단에서 빠질 수 있어 진행을 막았습니다. 엑셀의 사번 칸을 텍스트 서식으로 고쳐 다시 올려 주세요.</div>`;
+  if (iss.skipped && iss.skipped.length) h += `<div class="notice" style="${red}"><b>확인할 수 없는 행 ${iss.skipped.length}개 — 저장하지 않습니다.</b> (이 행의 은행·계좌번호·예금주는 모두 반영되지 않습니다)<br/>${list(iss.skipped, 15)}<br/>${esc(ACCT_HELP)}</div>`;
+  if (iss.phoneWarn && iss.phoneWarn.length) h += `<div class="notice" style="${amber}"><b>전화번호 형식 이상 ${iss.phoneWarn.length}건 — 저장은 되지만 확인하세요.</b> (값은 바꾸지 않았습니다)<br/>${list(iss.phoneWarn, 10)}</div>`;
+  return h;
+}
+
+function parseMemberSheet(raw) {
+  const hIdx = raw.findIndex(r => r.includes('사번'));
+  const headers = hIdx >= 0 ? raw[hIdx] : ['지단', '사번', '성명', '소속', '전화번호', '은행', '계좌번호'];
+  const start = hIdx >= 0 ? hIdx + 1 : 0;
+  const col = (n) => headers.indexOf(n);
+  const cellOf = (r, n) => (col(n) >= 0 ? String(r[col(n)] ?? '').trim() : '');
+  const rows = [];
+  const issues = { idBad: [], acctBad: [], phoneWarn: [], numAcct: 0 };
+  for (let i = start; i < raw.length; i++) {
+    const r = raw[i];
+    if (!r || r.every(c => String(c).trim() === '')) continue;
+    const empId = String(r[col('사번')] ?? '').trim();
+    if (!empId) continue;
+    const rowNo = raw.rowNo ? raw.rowNo(i) : i + 1;
+    const idRisk = raw.cellRisk ? raw.cellRisk(i, col('사번')) : null;
+    if (idRisk) { issues.idBad.push({ rowNo, shown: empId, reason: idRisk }); continue; }
+    let bank = cellOf(r, '은행'), account = cellOf(r, '계좌번호'), holder = cellOf(r, '예금주');
+    const accRisk = raw.cellRisk ? raw.cellRisk(i, col('계좌번호'), true) : null;
+    let acctBad = null;
+    if (accRisk) { acctBad = { rowNo, reason: accRisk }; issues.acctBad.push(acctBad); bank = ''; account = ''; holder = ''; }   // 계좌 정보는 세 칸을 함께 기존 값 유지(은행만 바뀌는 불일치 방지)
+    const phone = cellOf(r, '전화번호'), pr = phoneOddReason(phone);
+    if (pr) issues.phoneWarn.push({ rowNo, shown: phone, reason: pr });
+    rows.push({ group: cellOf(r, '지단'), empId, name: cellOf(r, '성명'), dept: cellOf(r, '소속'), phone, bank, account, holder, _acctBad: acctBad });   // _acctBad는 화면 구분용이며 저장되지 않는다
+  }
+  return { rows, cols: { bank: col('은행') >= 0, account: col('계좌번호') >= 0, holder: col('예금주') >= 0 }, issues };
+}
+
+// ---------- 다른 관리자의 변경 감지 (미리보기 이후 / 복원 도중) ----------
+// 미리보기를 보여준 시점의 파일 식별값(sha)을 기억해 두고, 실제 저장 직전에 같은지 확인한다.
+// 다르면 저장하지 않고 변경 내용을 다시 보여준 뒤, 사용자가 확인(체크)해야 다시 진행할 수 있다.
+let CLEANUP_RETRY_DELAYS = [2000, 4000, 8000];   // 일정 삭제 후 출석기록 정리가 실패했을 때 자동 재시도 간격(ms)
+
+function diffMembers(prev, next) {
+  const pm = new Map(prev.map(m => [memKey(m), m])), nm = new Map(next.map(m => [memKey(m), m]));
+  const added = [], removed = [], changed = [];
+  nm.forEach((m, k) => { const p = pm.get(k); if (!p) added.push(m); else if (!sameMember(p, m)) changed.push(m); });
+  pm.forEach((m, k) => { if (!nm.has(k)) removed.push(m); });
+  return { added, removed, changed };
+}
+const sampleNames = (list, n = 5) => list.length === 0 ? '-' : list.slice(0, n).map(m => `${esc(m.empId)} ${esc(m.name)}`).join(', ') + (list.length > n ? ` 외 ${list.length - n}명` : '');
+function staleNoticeHtml(title, d) {
+  return `<div class="notice" style="background:#fff0f0; color:#c62828;"><b>⚠ 미리보기를 본 뒤에 다른 사용자가 ${esc(title)}을(를) 변경했습니다. 저장하지 않았습니다.</b><br/>변경 내용: 추가 ${d.added.length}명 · 삭제 ${d.removed.length}명 · 수정 ${d.changed.length}명<br/>추가: ${sampleNames(d.added)}<br/>삭제: ${sampleNames(d.removed)}<br/>수정: ${sampleNames(d.changed)}<br/>아래는 <b>최신 명단 기준으로 다시 계산한 결과</b>입니다. 내용을 확인하셨다면 아래 칸을 체크한 뒤 다시 진행하세요.</div>
+    <label style="display:flex; align-items:center; gap:8px; font-weight:700; margin:8px 0 0;"><input type="checkbox" id="stale_ack" style="width:auto;" />위 변경 내용을 확인했습니다</label>`;
+}
+
+// ---------- 명단 교체 (미리보기 → 재확인 → 백업 후 교체) ----------
+async function handleReplaceMembers(content, e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const raw = await readSheetRows(file);
+  e.target.value = '';
+  if (!raw) return;
+  const { rows, cols, issues } = parseMemberSheet(raw);
+  if (rows.length === 0) return alert(issues.idBad.length ? `사번을 확인할 수 없는 행(${issues.idBad.length}개)만 있어 교체를 진행할 수 없습니다. 엑셀의 사번 칸을 텍스트 서식으로 고쳐 다시 올려 주세요. (명단은 바뀌지 않았습니다)` : '엑셀에서 사번이 있는 행을 찾지 못했습니다. 첫 행에 "사번" 열 제목이 있는지 확인하세요. (명단은 바뀌지 않았습니다)');
+  let base;
+  try { base = await ghGetJSON(PATHS.members, []); }   // 미리보기를 보여줄 명단과 그 시점의 sha
+  catch (err) { return alert('현재 명단을 읽지 못해 교체를 시작하지 않았습니다: ' + (err.message || err)); }
+  let attBase = null;   // 제외 대상의 출석 기록 건수 확인용(읽기만 함). 못 읽으면 '제외' 기능을 막는다.
+  try { attBase = await ghGetJSON(PATHS.attendance, []); } catch (err) { attBase = null; }
+  openReplacePreview(content, rows, cols, base, file.name, issues, attBase);
+}
+
+// 조합원별 출석 기록 건수 (사번 기준)
+function countAttendanceByMember(list) {
+  const m = new Map();
+  (list || []).forEach(a => { const k = memKey({ empId: a.empId }); m.set(k, (m.get(k) || 0) + 1); });
+  return m;
+}
+
+function openReplacePreview(content, rows, cols, base, fileName, issues = { idBad: [], acctBad: [], phoneWarn: [], numAcct: 0 }, attBase = null) {
+  let baseline = base;     // { data, sha } — 미리보기를 보여준 시점의 명단
+  let needAck = false;     // 다른 사용자의 변경이 감지되면 확인(체크)해야 진행할 수 있다
+  let att = attBase;       // { data, sha } 미리보기 시점의 출석 기록(읽기 전용)
+  let attCount = att ? countAttendanceByMember(att.data) : null;
+  const state = { removed: 0 };   // 지금 화면 기준 제외 예정 인원 수
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `
+    <div class="modal" style="width:560px;">
+      <h3 style="margin-top:0;">명단 교체 미리보기</h3>
+      <div style="font-size:12.5px; color:#888; margin-bottom:8px;">파일: ${esc(fileName)} · 엑셀 열 — 은행 ${cols.bank ? '있음' : '없음'} · 계좌번호 ${cols.account ? '있음' : '없음'} · 예금주 ${cols.holder ? '있음' : '없음'}</div>
+      <div id="rp_notice"></div>
+      <div id="rp_issues"></div>
+      <div id="rp_acct"></div>
+      <div id="rp_body"></div>
+      <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:12px 0 0;"><input type="checkbox" id="rp_drop" style="width:auto;" />엑셀에 없는 기존 조합원을 명단에서 제외 (기본: 제외하지 않고 그대로 둡니다)</label>
+      <div id="rp_ex"></div>
+      <div class="notice">규칙: 엑셀에 값이 있으면 그 값으로 바뀝니다. <b>열이 없거나 칸이 비어 있으면 기존 값(은행·계좌·예금주 포함)을 그대로 둡니다.</b> 값을 비우려면 '정보수정'을 쓰세요. 교체 직전에 현재 명단이 자동으로 백업됩니다.</div>
+      <div class="actions">
+        <button class="ghost" id="rp_cancel">취소</button>
+        <button class="primary" id="rp_go">백업 후 교체 진행</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bg);
+  bg.querySelector('#rp_issues').innerHTML = fileIssuesHtml({ ...issues, acctBad: [] });
+  const syncGo = () => {
+    const ack = bg.querySelector('#stale_ack'), ex = bg.querySelector('#rp_ex_ack'), drop = bg.querySelector('#rp_drop').checked;
+    const exBlocked = drop && (!att || (state.removed > 0 && !(ex && ex.checked)));   // 제외를 고르면: 출석 기록을 확인할 수 있어야 하고, 제외 확인 체크가 있어야 한다
+    bg.querySelector('#rp_go').disabled = issues.idBad.length > 0 || exBlocked || (needAck && !(ack && ack.checked));
+  };
+  const update = () => {
+    const drop = bg.querySelector('#rp_drop').checked;
+    const p = planMemberReplace(baseline.data, rows, drop);
+    const cls = classifyAcctIssues(rows, baseline.data);   // 미리보기 기준 명단으로 구분(명단이 바뀌어 다시 계산될 때마다 새로 만든다)
+    bg.querySelector('#rp_acct').innerHTML = acctSectionHtml(cls, issues.acctBad.length);
+    const dlBtn = bg.querySelector('#rp_dl'); if (dlBtn) dlBtn.onclick = () => downloadAcctCheckList(cls);
+    const ratio = baseline.data.length ? p.removed.length / baseline.data.length : 0;
+    // 제외 예정 인원 표시 (제외를 선택한 경우에만)
+    state.removed = drop ? p.removed.length : 0;
+    const exBox = bg.querySelector('#rp_ex'), red = 'background:#fdeaea; color:#c62828;';
+    const nameList = (arr, f) => arr.slice(0, 300).map(f).join('<br/>') + (arr.length > 300 ? `<br/>외 ${arr.length - 300}명` : '');
+    if (!drop) exBox.innerHTML = '';
+    else if (!att) exBox.innerHTML = `<div class="notice" style="${red}"><b>출석 기록을 읽지 못해 '제외'를 사용할 수 없습니다.</b> 제외 체크를 해제하면 제외 없이 교체할 수 있습니다. (저장하지 않았습니다)</div>`;
+    else if (p.removed.length === 0) exBox.innerHTML = `<div class="note" style="margin-top:6px;">제외 예정 인원이 없습니다.</div>`;
+    else {
+      const withAtt = p.removed.map(m => ({ m, n: attCount.get(memKey(m)) || 0 })).filter(x => x.n > 0);
+      exBox.innerHTML = `<div class="notice" style="${red}"><b>제외 예정 ${p.removed.length.toLocaleString()}명</b> — 엑셀에 없어서 명단에서 빠집니다.<div style="max-height:150px; overflow:auto; margin-top:4px;">${nameList(p.removed, m => `${esc(m.empId)} ${esc(m.name)}`)}</div></div>
+        ${withAtt.length ? `<div class="notice" style="${red}"><b>⚠ 출석 기록이 있는 인원 ${withAtt.length.toLocaleString()}명이 제외됩니다.</b> 출석 기록은 남아 집계·지급에는 계속 포함되지만, 명단에서 빠지면 소속·은행·계좌번호가 비어 <b>지급 계좌정보가 누락</b>될 수 있습니다.<div style="max-height:150px; overflow:auto; margin-top:4px;">${nameList(withAtt, x => `${esc(x.m.empId)} ${esc(x.m.name)} · 출석 기록 ${x.n.toLocaleString()}건`)}</div></div>` : ''}
+        <label style="display:flex; align-items:flex-start; gap:8px; font-weight:700; margin:8px 0 0;"><input type="checkbox" id="rp_ex_ack" style="width:auto; margin-top:5px;" />위 ${p.removed.length.toLocaleString()}명을 명단에서 제외하는 것을 확인했습니다${withAtt.length ? ` (출석 기록이 있는 ${withAtt.length.toLocaleString()}명의 지급 계좌정보가 누락될 수 있음을 확인했습니다)` : ''}.</label>`;
+      const exAck = bg.querySelector('#rp_ex_ack'); if (exAck) exAck.addEventListener('change', syncGo);
+    }
+    bg.querySelector('#rp_body').innerHTML = `
+      <table style="font-size:12.5px;">
+        <tr><td>엑셀 인원</td><td><b>${(rows.length - p.dupRows).toLocaleString()}명</b>${p.dupRows ? ` (같은 사번이 겹친 ${p.dupRows}행은 첫 행만 사용)` : ''}</td></tr>
+        <tr><td>현재 명단</td><td><b>${baseline.data.length.toLocaleString()}명</b></td></tr>
+        <tr><td>추가</td><td><b>${p.added.length.toLocaleString()}명</b> · ${sampleNames(p.added, 8)}</td></tr>
+        <tr><td>변경(엑셀 값으로 갱신)</td><td><b>${p.changed.length.toLocaleString()}명</b> · ${sampleNames(p.changed, 8)}</td></tr>
+        <tr><td>변경 없음</td><td><b>${p.unchanged.length.toLocaleString()}명</b></td></tr>
+        <tr><td>제외</td><td><b>${p.removed.length.toLocaleString()}명</b> · ${sampleNames(p.removed, 8)}</td></tr>
+        <tr><td>기존 은행·계좌·예금주 유지</td><td><b>${p.bankKept.toLocaleString()}명</b></td></tr>
+      </table>
+      ${ratio > 0.2 ? `<div class="notice" style="background:#fdeaea; color:#c62828;">현재 명단의 ${Math.round(ratio * 100)}%가 제외됩니다. 일부만 담긴 파일을 올린 것은 아닌지 확인하세요.</div>` : ''}`;
+    syncGo();
+  };
+  update();
+  bg.querySelector('#rp_drop').addEventListener('change', update);
+  bg.querySelector('#rp_cancel').onclick = () => bg.remove();
+  bg.querySelector('#rp_go').onclick = async () => {
+    if (issues.idBad.length) return;   // 사번을 확인할 수 없는 행이 있으면 교체하지 않는다
+    const go = bg.querySelector('#rp_go'), cancel = bg.querySelector('#rp_cancel');
+    const drop = bg.querySelector('#rp_drop').checked;
+    if (drop) {
+      const pNow = planMemberReplace(baseline.data, rows, true), exEl = bg.querySelector('#rp_ex_ack');
+      if (!att || (pNow.removed.length > 0 && !(exEl && exEl.checked))) return;   // 제외 확인 없이는 진행하지 않는다
+      if (pNow.removed.length > 0) {
+        go.disabled = true; cancel.disabled = true; go.textContent = '⏳ 최신 출석 기록 확인 중...';
+        let nowAtt;
+        try { nowAtt = await ghGetJSON(PATHS.attendance, []); }
+        catch (e2) { cancel.disabled = false; go.textContent = '백업 후 교체 진행'; syncGo(); return alert('최신 출석 기록을 읽지 못해 제외를 진행하지 않았습니다: ' + (e2.message || e2) + '\n(저장하지 않았습니다)'); }
+        if (changedSince(att.sha, att.data, nowAtt.sha, nowAtt.data)) {   // 다른 관리자가 출석 기록을 바꿨다 → 저장하지 않고 제외 대상의 출석 건수를 최신으로 다시 계산한다
+          att = nowAtt; attCount = countAttendanceByMember(att.data);
+          bg.querySelector('#rp_notice').innerHTML = '<div class="notice" style="background:#fff0f0; color:#c62828;"><b>⚠ 미리보기 이후 출석 기록이 변경되었습니다. 저장하지 않았습니다.</b><br/>제외 대상의 출석 기록 건수를 최신으로 다시 계산했습니다. 아래 제외 목록을 다시 확인한 뒤 체크하고 진행하세요.</div>';
+          cancel.disabled = false; go.textContent = '백업 후 교체 진행'; update(); return;
+        }
+      }
+    }
+    go.disabled = true; cancel.disabled = true; go.textContent = '⏳ 백업 후 교체 중...';
+    let backupPath = '';
+    const res = await mutateJSON(PATHS.members, [], (latest, meta) => {
+      // 미리보기를 본 뒤 다른 사용자가 명단을 바꿨다면 저장하지 않는다.
+      if (changedSince(baseline.sha, baseline.data, meta.sha, latest)) throw new StaleError('미리보기 이후 명단이 변경되었습니다.', latest, meta.sha);
+      const p = planMemberReplace(latest, rows, drop);
+      if (p.added.length === 0 && p.changed.length === 0 && p.removed.length === 0) return null;
+      return { data: p.next, result: { added: p.added.length, changed: p.changed.length, removed: p.removed.length, total: p.next.length, removedKeys: p.removed.map(m => memKey(m)), acctCls: classifyAcctIssues(rows, latest) } };   // 저장 직전의 최신 명단 기준으로 다시 계산
+    }, (r) => `조합원 명단 교체 (${r.total}명: 추가 ${r.added}, 변경 ${r.changed}, 제외 ${r.removed})`, {
+      beforeWrite: async (latest) => { backupPath = await writeBackup('members-before-replace', { members: latest }, `교체 파일: ${fileName}`); }
+    });
+    if (!res.ok) {
+      cancel.disabled = false; go.textContent = '백업 후 교체 진행';
+      if (res.stale) {
+        const d = diffMembers(baseline.data, res.stale.data);
+        baseline = { data: res.stale.data, sha: res.stale.sha };
+        needAck = true;
+        bg.querySelector('#rp_notice').innerHTML = staleNoticeHtml('조합원 명단', d);
+        bg.querySelector('#stale_ack').addEventListener('change', syncGo);
+        update(); syncGo();
+        return;
+      }
+      go.disabled = false;
+      return alert((res.backupFailed ? '백업에 실패해 교체하지 않았습니다.\n' : (res.unknown ? '교체 결과 확인 필요: ' : '교체 실패: ')) + res.error + (res.unknown ? '' : '\n(기존 명단은 그대로입니다)'));
+    }
+    bg.remove();
+    if (res.unchanged) return alert('엑셀과 현재 명단이 같아 바꿀 내용이 없습니다. (저장하지 않았습니다)');
+    const r = res.result || {};
+    const ac = r.acctCls || [], acNeed = ac.filter(x => x.need).length;
+    const kAtt = (r.removedKeys || []).filter(k => attCount && (attCount.get(k) || 0) > 0).length;   // 제외된 인원 중 출석 기록이 있는 인원
+    alert(`교체 완료: 총 ${res.data.length.toLocaleString()}명 (추가 ${r.added}, 변경 ${r.changed}, 제외 ${r.removed})\n교체 직전 백업: ${backupPath}` + (kAtt ? `\n⚠ 제외된 인원 중 출석 기록이 있는 ${kAtt}명은 지급 계좌정보가 누락될 수 있으니 확인하세요.` : '') + (ac.length ? `\n계좌정보 확인 필요 ${acNeed}명 · 기존 값 유지 ${ac.length - acNeed}명 (사번·이름 목록은 다음 창에서 확인·내려받기)` : ''));
+    renderMembers(content, 0, '', res.data);
+    if (ac.length) showAcctDoneModal(ac, fileName);
+  };
+}
+
+// ---------- 계좌정보 일괄 등록 (미리보기 → 재확인 → 백업 후 반영) ----------
+const maskAcct = (s) => { const t = norm(s); return t === '' ? '(없음)' : (t.length <= 4 ? '****' : '****' + t.slice(-4)); };
+
+// 엑셀 값이 있는 칸만 반영한다(빈 칸은 기존 값 유지). 같은 사번이 여러 행이면 나중 행이 우선(기존 동작 유지).
+function planBankUpdate(current, updates) {
+  const idx = new Map(current.map((m, i) => [memKey(m), i]));
+  const next = current.map(m => ({ ...m }));
+  const targets = new Map();
+  const unmatched = [];
+  const rowsById = new Map();
+  updates.forEach(u => { const k = memKey(u); if (!rowsById.has(k)) rowsById.set(k, []); rowsById.get(k).push(u); });
+  updates.forEach(u => {
+    const k = memKey(u), i = idx.get(k);
+    if (i === undefined) { if (!unmatched.includes(u.empId)) unmatched.push(u.empId); return; }
+    if (!targets.has(k)) targets.set(k, { before: { ...current[i] }, after: next[i] });
+    if (u.bank) next[i].bank = u.bank;
+    if (u.account) next[i].account = u.account;
+    if (u.holder) next[i].holder = u.holder;
+  });
+  const fill = [], overwrite = [], same = [];
+  const fieldCount = { bank: 0, account: 0, holder: 0 };
+  targets.forEach(({ before, after }) => {
+    const ch = ['bank', 'account', 'holder'].filter(f => norm(before[f]) !== norm(after[f]));
+    if (ch.length === 0) { same.push(after); return; }
+    ch.forEach(f => fieldCount[f]++);
+    (ch.some(f => norm(before[f]) !== '') ? overwrite : fill).push({ before, after, fields: ch });
+  });
+  const dups = [...rowsById.entries()].filter(([, rows]) => rows.length > 1).map(([k, rows]) => ({
+    empId: rows[0].empId, count: rows.length, matched: idx.has(k),
+    conflict: new Set(rows.map(r => `${r.bank}|${r.account}|${r.holder}`)).size > 1
+  }));
+  return { next, matched: targets.size, fill, overwrite, same, unmatched, dups, fieldCount, uniqueRows: rowsById.size, rowCount: updates.length,
+           changedMembers: fill.length + overwrite.length, fieldTotal: fieldCount.bank + fieldCount.account + fieldCount.holder };
+}
+
+async function handleBankUpdate(content, e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const btn = document.getElementById('bankUpdateBtn');
+  const idle = () => { if (btn) { btn.disabled = false; btn.textContent = '계좌정보 일괄 등록'; } };
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 파일 확인 중...'; }
+  const raw = await readSheetRows(file);
+  e.target.value = '';
+  if (!raw) return idle();
+
+  const hIdx = raw.findIndex(r => r.includes('사번'));
+  let idIdx, bankIdx, accountIdx, holderIdx, start;
+  if (hIdx >= 0) {
+    const headers = raw[hIdx];
+    idIdx = headers.indexOf('사번');
+    bankIdx = headers.indexOf('은행');
+    accountIdx = headers.indexOf('계좌번호');
+    holderIdx = headers.indexOf('예금주');
+    start = hIdx + 1;
+  } else {
+    idIdx = 0; bankIdx = 1; accountIdx = 2; holderIdx = 3; start = 0; // 헤더가 없으면 사번,은행,계좌번호,예금주 순서로 간주
+  }
+  const updates = [];
+  const issues = { skipped: [], numAcct: 0 };
+  for (let i = start; i < raw.length; i++) {
+    const r = raw[i];
+    if (!r || r.every(c => String(c).trim() === '')) continue;
+    const empId = String(r[idIdx] ?? '').trim();
+    if (!empId) continue;
+    // 사번이나 계좌번호를 확인할 수 없는 행은 통째로 제외한다. (은행만 바뀌고 계좌는 그대로인 불일치를 막기 위해 한 행을 쪼개 저장하지 않는다)
+    const idRisk = raw.cellRisk ? raw.cellRisk(i, idIdx) : null, accRisk = raw.cellRisk && accountIdx >= 0 ? raw.cellRisk(i, accountIdx, true) : null;
+    if (idRisk || accRisk) { issues.skipped.push({ rowNo: raw.rowNo ? raw.rowNo(i) : i + 1, shown: idRisk ? empId : maskAcct(String(r[accountIdx] ?? '').trim()), reason: (idRisk ? '사번: ' + idRisk : '계좌번호: ' + accRisk) }); continue; }
+    const accText = accountIdx >= 0 ? String(r[accountIdx] ?? '').trim() : '';
+    updates.push({
+      empId,
+      bank: bankIdx >= 0 ? String(r[bankIdx] ?? '').trim() : '',
+      account: accText,
+      holder: holderIdx >= 0 ? String(r[holderIdx] ?? '').trim() : ''
+    });
+  }
+  idle();
+  if (updates.length === 0 && issues.skipped.length === 0) return alert('엑셀에서 사번이 있는 행을 찾지 못했습니다. (명단은 바뀌지 않았습니다)');
+  let base;
+  try { base = await ghGetJSON(PATHS.members, []); }
+  catch (err) { return alert('현재 명단을 읽지 못해 일괄 등록을 시작하지 않았습니다: ' + (err.message || err)); }
+  openBankPreview(content, updates, base, file.name, issues);
+}
+
+function openBankPreview(content, updates, base, fileName, issues = { skipped: [], numAcct: 0 }) {
+  let baseline = base, needAck = false;
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = `
+    <div class="modal" style="width:600px;">
+      <h3 style="margin-top:0;">계좌정보 일괄 등록 미리보기</h3>
+      <div style="font-size:12.5px; color:#888; margin-bottom:8px;">파일: ${esc(fileName)}</div>
+      <div id="bp_notice"></div>
+      <div id="bp_issues"></div>
+      <div id="bp_body"></div>
+      <label style="display:flex; align-items:center; gap:8px; font-weight:700; margin:12px 0 0;"><input type="checkbox" id="bp_final" style="width:auto;" />위 내용을 확인했으며, 이대로 반영하는 것을 최종 승인합니다.</label>
+      <div class="notice">규칙: 엑셀 칸이 비어 있으면 기존 값을 그대로 둡니다. 같은 사번이 여러 번 나오면 나중 행의 값을 씁니다. 계좌번호는 화면에서 끝 4자리만 보여줍니다. 반영 직전에 현재 명단이 자동 백업됩니다.</div>
+      <div class="actions">
+        <button class="ghost" id="bp_cancel">취소</button>
+        <button class="primary" id="bp_go">백업 후 반영</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bg);
+  bg.querySelector('#bp_issues').innerHTML = fileIssuesHtml(issues);
+  const detail = (c) => c.fields.map(f => f === 'account' ? `계좌 ${esc(maskAcct(c.before.account))}→${esc(maskAcct(c.after.account))}` : `${f === 'bank' ? '은행' : '예금주'} ${esc(norm(c.before[f]) || '(없음)')}→${esc(c.after[f])}`).join(', ');
+  const samples = (list, n = 5) => list.length === 0 ? '-' : list.slice(0, n).map(c => `${esc(c.after.empId)} ${esc(c.after.name)} (${detail(c)})`).join('<br/>') + (list.length > n ? `<br/>외 ${list.length - n}명` : '');
+  const syncGo = () => {
+    const p = planBankUpdate(baseline.data, updates);
+    const ack = bg.querySelector('#stale_ack'), fin = bg.querySelector('#bp_final');
+    bg.querySelector('#bp_go').disabled = p.changedMembers === 0 || !(fin && fin.checked) || (needAck && !(ack && ack.checked));
+  };
+  const update = () => {
+    const p = planBankUpdate(baseline.data, updates);
+    const idList = (arr, n) => arr.slice(0, n).map(esc).join(', ') + (arr.length > n ? ` 외 ${arr.length - n}건` : '');
+    bg.querySelector('#bp_body').innerHTML = `
+      <table style="font-size:12.5px;">
+        <tr><td>엑셀 내용</td><td><b>${p.rowCount.toLocaleString()}행</b> · 고유 사번 <b>${p.uniqueRows.toLocaleString()}명</b></td></tr>
+        <tr><td>변경 대상 인원(명단에서 찾음)</td><td><b>${p.matched.toLocaleString()}명</b></td></tr>
+        <tr><td>실제 변경</td><td><b style="${p.changedMembers ? '' : 'color:#888;'}">${p.changedMembers.toLocaleString()}명 · 총 ${p.fieldTotal.toLocaleString()}건</b> (은행 ${p.fieldCount.bank} · 계좌번호 ${p.fieldCount.account} · 예금주 ${p.fieldCount.holder})</td></tr>
+        <tr><td>├ 새로 채움(기존 값 없음)</td><td><b>${p.fill.length.toLocaleString()}명</b><br/>${samples(p.fill)}</td></tr>
+        <tr><td>├ 기존 값을 다른 값으로 바꿈</td><td><b style="${p.overwrite.length ? 'color:#c62828;' : ''}">${p.overwrite.length.toLocaleString()}명</b><br/>${samples(p.overwrite)}</td></tr>
+        <tr><td>└ 변경 없음</td><td><b>${p.same.length.toLocaleString()}명</b></td></tr>
+        <tr><td>중복 사번</td><td><b style="${p.dups.some(d => d.conflict) ? 'color:#c62828;' : ''}">${p.dups.length.toLocaleString()}건</b>${p.dups.length ? ' · ' + p.dups.slice(0, 10).map(d => `${esc(d.empId)}(${d.count}행${d.conflict ? ', 값이 서로 다름 → 나중 행 사용' : ', 값 같음'})`).join(', ') + (p.dups.length > 10 ? ` 외 ${p.dups.length - 10}건` : '') : ''}</td></tr>
+        <tr><td>미등록 사번(명단에 없음, 반영 안 됨)</td><td><b>${p.unmatched.length.toLocaleString()}건</b>${p.unmatched.length ? ' · ' + idList(p.unmatched, 30) : ''}</td></tr>
+      </table>
+      ${p.changedMembers === 0 ? '<div class="notice">반영할 변경이 없습니다.</div>' : ''}`;
+    syncGo();
+  };
+  update();
+  bg.querySelector('#bp_final').addEventListener('change', syncGo);
+  bg.querySelector('#bp_cancel').onclick = () => bg.remove();
+  bg.querySelector('#bp_go').onclick = async () => {
+    const go = bg.querySelector('#bp_go'), cancel = bg.querySelector('#bp_cancel');
+    go.disabled = true; cancel.disabled = true; go.textContent = '⏳ 백업 후 반영 중...';
+    let backupPath = '';
+    const res = await mutateJSON(PATHS.members, [], (latest, meta) => {
+      // 최종 승인한 화면의 명단과 저장 직전 최신 명단이 다르면 저장하지 않는다.
+      if (changedSince(baseline.sha, baseline.data, meta.sha, latest)) throw new StaleError('미리보기 이후 명단이 변경되었습니다.', latest, meta.sha);
+      const p = planBankUpdate(latest, updates);
+      if (p.changedMembers === 0) return null;
+      return { data: p.next, result: { changed: p.changedMembers, fill: p.fill.length, overwrite: p.overwrite.length, same: p.same.length, unmatched: p.unmatched } };
+    }, (r) => `계좌정보 일괄 등록 (${r.changed}명)`, { beforeWrite: async (latest) => { backupPath = await writeBackup('members-before-bank-update', { members: latest }, `파일: ${fileName}`); } });
+    if (!res.ok) {
+      cancel.disabled = false; go.textContent = '백업 후 반영';
+      if (res.stale) {
+        const d = diffMembers(baseline.data, res.stale.data);
+        baseline = { data: res.stale.data, sha: res.stale.sha };
+        needAck = true;
+        bg.querySelector('#bp_final').checked = false;   // 최신 명단 기준으로 다시 계산했으니 최종 승인도 다시 받는다
+        bg.querySelector('#bp_notice').innerHTML = staleNoticeHtml('조합원 명단', d);
+        bg.querySelector('#stale_ack').addEventListener('change', syncGo);
+        update();
+        return;
+      }
+      go.disabled = false;
+      return alert((res.backupFailed ? '백업에 실패해 저장하지 않았습니다: ' : (res.unknown ? '저장 결과 확인 필요: ' : '저장 실패: ')) + res.error + (res.unknown ? '' : '\n(저장되지 않았습니다)'));
+    }
+    bg.remove();
+    if (res.unchanged) return alert('반영할 변경이 없어 저장하지 않았습니다.');
+    const r = res.result;
+    alert(`계좌정보 ${r.changed}명 업데이트 완료 (새로 채움 ${r.fill}, 값 변경 ${r.overwrite}${r.same ? `, 변경 없음 ${r.same}` : ''})${r.unmatched.length ? `\n명단에 없는 사번 ${r.unmatched.length}건: ${r.unmatched.join(', ')}` : ''}\n(저장 직전 명단이 자동 백업되었습니다: ${backupPath})`);
+    renderMembers(content, 0, '', res.data);
+  };
+}
+
+// ---------- 삭제된 일정의 잔여 출석기록 안전 정리 ----------
+// 일정 삭제 중 출석기록 정리가 끝나지 못한 경우를 위한 기능. 현재 있는 일정의 출석기록은 건드리지 않고, 정리 직전에 백업한다.
+async function cleanupOrphans(content) {
+  if (!requireToken()) return;
+  const btn = document.getElementById('orphanBtn');
+  const idle = () => { if (btn) { btn.disabled = false; btn.textContent = '안전하게 정리'; } };
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 확인 중...'; }
+  let evs, att;
+  try { [evs, att] = await Promise.all([ghGetJSON(PATHS.events, []), ghGetJSON(PATHS.attendance, [])]); }
+  catch (err) { idle(); return alert('최신 데이터를 읽지 못했습니다: ' + (err.message || err)); }
+  const evIds = new Set(evs.data.map(e => e.id));
+  const orphans = att.data.filter(a => !evIds.has(a.eventId));
+  if (orphans.length === 0) { idle(); alert('정리할 출석기록이 없습니다.'); return renderEvents(content); }
+  const orphanIds = [...new Set(orphans.map(a => a.eventId))];
+  if (!confirm(`삭제된 일정 ${orphanIds.length}개의 출석기록 ${orphans.length.toLocaleString()}건을 정리합니다.\n현재 있는 일정의 출석기록은 건드리지 않으며, 정리 직전에 이 기록이 자동으로 백업됩니다.\n계속할까요?`)) { idle(); return; }
+  const idSet = new Set(orphanIds);
+  let backupPath = '';
+  const res = await mutateJSON(PATHS.attendance, [], (all) => {
+    const rest = all.filter(a => !idSet.has(a.eventId));
+    if (rest.length === all.length) return null;
+    return { data: rest, result: { removed: all.length - rest.length } };
+  }, (r) => `삭제된 일정의 출석기록 정리 (${r.removed}건)`, {
+    beforeWrite: async (latest) => {
+      // 그 사이 정리 대상 일정이 복원되었다면 중단한다.
+      const nowEvents = await ghGetJSON(PATHS.events, []);
+      if (nowEvents.data.some(e => idSet.has(e.id))) throw new Error('정리 대상 일정이 그 사이 복원되어 정리를 중단했습니다.');
+      backupPath = await writeBackup('orphan-attendance', { attendance: latest.filter(a => idSet.has(a.eventId)), eventIds: orphanIds });
+    }
+  });
+  if (!res.ok) { idle(); return alert('정리하지 않았습니다: ' + res.error + (res.unknown ? '' : '\n(출석기록은 그대로입니다)')); }
+  alert(res.unchanged ? '이미 정리되어 있습니다.' : `출석기록 ${res.result.removed.toLocaleString()}건을 정리했습니다.\n백업: ${backupPath}`);
+  renderEvents(content);
+}
+
+
+// ---------- 일정 삭제: 일정 + 출석기록을 안전하게 함께 처리 ----------
+// GitHub는 파일 2개를 한 번에 저장하지 못하므로 ① 삭제 직전 백업(일정+그 출석기록) ② 일정 삭제 → 실제 삭제 확인
+// ③ 출석기록 정리(자동 재시도) → 실제 정리 확인 순서로 처리한다. 일정을 먼저 지우는 이유: 도중에 멈춰도 "보이지 않는 잔여 기록"만 남고
+// (일정은 남았는데 출석만 사라지는 사고가 없다), 남은 기록은 일정 게시판의 [안전하게 정리]로 언제든 마저 정리·재시도할 수 있다.
+async function deleteEventSafely(content, id, btn, settings) {
+  const restoreBtn = () => { if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '삭제'; } };
+  let target, backupPath;
+  const backedIds = new Set();   // 지금까지 백업에 들어간 출석기록 id
+  let extraBackups = 0, extraRecords = 0;   // 삭제 직전 백업 이후 추가분을 따로 백업한 횟수·건수
+  try {
+    const [evs, att] = await Promise.all([ghGetJSON(PATHS.events, []), ghGetJSON(PATHS.attendance, [])]);
+    target = evs.data.find(e => e.id === id);
+    if (!target) { restoreBtn(); alert('이미 삭제된 일정입니다. 목록을 새로 불러옵니다.'); return renderEvents(content); }
+    const mine = att.data.filter(a => a.eventId === id);
+    backupPath = await writeBackup('event-deleted', { event: target, attendance: mine });
+    mine.forEach(a => backedIds.add(a.id));
+  } catch (err) { restoreBtn(); return alert('백업에 실패해 삭제하지 않았습니다: ' + (err.message || err)); }
+  // 일정 삭제. 저장 결과가 불확실하면 실제 상태를 다시 읽어 확인한다.
+  const r1 = await mutateJSON(PATHS.events, [], (evs) => evs.some(e => e.id === id) ? { data: evs.filter(e => e.id !== id) } : null, `일정 삭제: ${id}`);
+  let eventsNow = r1.ok ? r1.data : null;
+  if (!r1.ok) { try { eventsNow = (await ghGetJSON(PATHS.events, [])).data; } catch (e) { eventsNow = null; } }
+  if (!eventsNow || eventsNow.some(e => e.id === id)) { restoreBtn(); alert('삭제 실패: ' + (r1.error || '일정이 삭제되었는지 확인하지 못했습니다.') + '\n(일정이 삭제된 것을 확인하지 못해 출석기록은 건드리지 않았습니다)'); return renderEvents(content); }
+  // 출석기록 정리 — 실패하면 자동으로 몇 번 더 시도한다.
+  const cleanup = () => mutateJSON(PATHS.attendance, [], (att) => { const rest = att.filter(a => a.eventId !== id); return rest.length === att.length ? null : { data: rest }; }, `일정 삭제에 따른 출석기록 정리: ${id}`, {
+    attempts: 3,
+    // 지우기 직전에 읽은 최신 기록 중, 처음 백업에 없던 것(백업 이후에 다른 사람이 추가한 출석)은 먼저 따로 백업한다. 백업에 실패하면 지우지 않는다. (읽은 뒤 또 바뀌면 저장이 충돌로 거절되고 다시 읽어 이 단계를 반복한다)
+    beforeWrite: async (cur) => {
+      const late = cur.filter(a => a.eventId === id && !backedIds.has(a.id));
+      if (late.length) { await writeBackup('orphan-attendance', { attendance: late, eventIds: [id] }, '일정 삭제 직전 백업 이후에 추가된 출석기록'); late.forEach(a => backedIds.add(a.id)); extraBackups++; extraRecords += late.length; }
+    }
+  });
+  let r2 = await cleanup();
+  for (let i = 0; i < CLEANUP_RETRY_DELAYS.length && !r2.ok && r2.retryable !== false; i++) { await sleep(CLEANUP_RETRY_DELAYS[i]); r2 = await cleanup(); }
+  // 실제로 남았는지 다시 읽어 확인한다.
+  let attNow = null;
+  try { attNow = (await ghGetJSON(PATHS.attendance, [])).data; } catch (e) { attNow = null; }
+  const left = attNow ? attNow.filter(a => a.eventId === id).length : null;
+  if (left !== 0) alert('일정은 삭제됐지만 출석기록 정리가 끝났는지 확인하지 못했거나 일부가 남았습니다' + (left ? ` (남은 기록 ${left}건)` : '') + (r2.ok ? '' : ': ' + r2.error) + '\n일정 게시판 위쪽의 [안전하게 정리] 버튼으로 마저 정리(재시도)할 수 있습니다. (삭제 직전에 백업해 두었습니다: ' + backupPath + ')');
+  if (extraBackups > 0) alert(`일정 삭제 직전에 다른 사용자가 추가한 출석기록 ${extraRecords}건을 별도 백업("정리한 잔여 출석기록") ${extraBackups}개에 나눠 담았습니다. (추가가 계속되면 백업이 더 생길 수 있습니다)\n이 일정을 되살리려면 복원 순서: ① "삭제한 일정과 그 출석기록" 백업을 먼저 복원 ② 이어서 "정리한 잔여 출석기록" 백업을 복원하세요.`);
+  renderEvents(content, 0, attNow ? { events: eventsNow, attendance: attNow, settings } : null);
+}
+
+// ---------- 백업 카드(사용자 설정 화면) ----------
+function wireBackupCard() {
+  const listEl = document.getElementById('bkList');
+  document.getElementById('bkDownloadAll').onclick = async (ev) => {
+    if (!requireToken()) return;
+    const btn = ev.currentTarget; const label = btn.textContent;
+    btn.disabled = true; btn.textContent = '⏳ 준비 중...';
+    try {
+      const { _sha, ...data } = await readAllDataFresh();
+      downloadJSON(`백업-${backupStamp()}.json`, { app: 'strike-attendance', version: 1, kind: 'full', createdAt: new Date().toISOString(), createdBy: session ? `${session.empId} ${session.name}` : '', data });
+    } catch (err) { alert('백업 파일을 만들지 못했습니다: ' + (err.message || err)); }
+    btn.disabled = false; btn.textContent = label;
+  };
+  const showList = async () => {
+    if (!requireToken()) return;
+    listEl.innerHTML = '<div class="empty">불러오는 중...</div>';
+    try {
+      const items = await listBackups();
+      listEl.innerHTML = items.length === 0 ? '<div class="empty">자동 백업이 아직 없습니다.</div>' : `
+        <table><thead><tr><th>시각</th><th>종류</th><th>크기</th><th></th></tr></thead>
+        <tbody>${items.map((b, i) => `<tr><td>${esc(b.when)}</td><td>${esc(b.label)}</td><td>${esc(b.sizeText)}</td>
+          <td class="row-flex"><button class="icon ghost" data-bkdl="${i}">내려받기</button><button class="icon ghost" data-bkrs="${i}">복원</button></td></tr>`).join('')}</tbody></table>`;
+      listEl.querySelectorAll('[data-bkdl]').forEach(el => el.onclick = async () => {
+        try { const f = await ghGetJSON(items[Number(el.dataset.bkdl)].path, null); downloadJSON(items[Number(el.dataset.bkdl)].name, f.data); }
+        catch (err) { alert('백업 파일을 내려받지 못했습니다: ' + (err.message || err)); }
+      });
+      listEl.querySelectorAll('[data-bkrs]').forEach(el => el.onclick = async () => {
+        try { const it = items[Number(el.dataset.bkrs)]; const f = await ghGetJSON(it.path, null); openRestoreModal(f.data, it.name); }
+        catch (err) { alert('백업 파일을 읽지 못했습니다: ' + (err.message || err)); }
+      });
+    } catch (err) { listEl.innerHTML = `<div class="notice">${esc(err.message || err)}</div>`; }
+  };
+  document.getElementById('bkRefresh').onclick = showList;
+  document.getElementById('bkRestoreFile').onclick = () => document.getElementById('bkFile').click();
+  document.getElementById('bkFile').addEventListener('change', async (ev) => {
+    const f = ev.target.files[0];
+    ev.target.value = '';
+    if (!f) return;
+    let rec;
+    try { rec = JSON.parse(await f.text()); } catch (err) { return alert('백업 파일을 읽지 못했습니다. (JSON 파일이 아니거나 손상됨)'); }
+    openRestoreModal(rec, f.name);
+  });
+}
+
+// ---------- 복원 + 복원 검증 ----------
+function verifyRestore(p, actual) {
+  if (p.key === 'settings') {
+    const ok = Number(actual.rate) === Number(p.data.rate);
+    return { title: p.title, ok, text: ok ? `지급액 ${Number(actual.rate).toLocaleString()}원 일치` : `지급액 불일치 (백업 ${p.data.rate} / 실제 ${actual.rate})` };
+  }
+  const fields = { members: MEMBER_FIELDS, member: MEMBER_FIELDS, events: ['name', 'date', 'start', 'end', 'hours', 'regId'], event: ['name', 'date', 'start', 'end', 'hours', 'regId'], attendance: ['eventId', 'empId', 'name'], att: ['eventId', 'empId', 'name'] }[p.key];
+  const keyFn = (p.key === 'members' || p.key === 'member') ? memKey : (p.key === 'events' || p.key === 'event') ? (x) => norm(x.id) : (x) => norm(x.id) || `${x.eventId}|${memKey(x)}`;
+  const actualMap = new Map(actual.map(x => [keyFn(x), x]));
+  const expected = p.mode === 'replace' ? p.data : (p.mode === 'readd-att' ? p.items : [p.item]);
+  let missing = 0, mismatched = 0;
+  expected.forEach(x => { const a = actualMap.get(keyFn(x)); if (!a) { missing++; return; } if (!fields.every(f => norm(a[f]) === norm(x[f]))) mismatched++; });
+  const extra = p.mode === 'replace' ? Math.max(0, actual.length - expected.length) : 0;
+  const countOk = p.mode !== 'replace' || actual.length === expected.length;
+  const ok = missing === 0 && mismatched === 0 && extra === 0 && countOk;
+  const countText = p.mode === 'replace' ? `건수 ${countOk ? '일치' : '불일치'} (백업 ${expected.length.toLocaleString()} / 실제 ${actual.length.toLocaleString()})` : `복원 대상 ${expected.length.toLocaleString()}건 확인`;
+  return { title: p.title, ok, text: `${countText} · 누락 ${missing}건 · 주요 필드 불일치 ${mismatched}건` };
+}
+
+async function openRestoreModal(rec, label, notice) {
+  if (!requireToken()) return;
+  if (!rec || rec.app !== 'strike-attendance' || !rec.kind || !rec.data || typeof rec.data !== 'object') { alert('이 프로그램에서 만든 백업 파일이 아닙니다.'); return; }
+  const bg = document.createElement('div');
+  bg.className = 'modal-bg';
+  bg.innerHTML = '<div class="modal" style="width:580px;"><div class="empty">현재 데이터와 비교하는 중...</div></div>';
+  document.body.appendChild(bg);
+  const modal = bg.querySelector('.modal');
+  const d = rec.data, kind = rec.kind;
+  let cur;
+  try { cur = await readAllDataFresh(); } catch (err) { bg.remove(); alert('현재 데이터를 읽지 못했습니다: ' + (err.message || err)); return; }
+  const isFull = kind === 'full' || kind === 'full-before-restore';
+  const plan = [];
+  if (Array.isArray(d.members) && (isFull || kind.startsWith('members-'))) plan.push({ key: 'members', title: '조합원 명단', path: PATHS.members, fallback: [], mode: 'replace', data: d.members, current: cur.members, optional: isFull });
+  if (isFull && Array.isArray(d.events)) plan.push({ key: 'events', title: '일정', path: PATHS.events, fallback: [], mode: 'replace', data: d.events, current: cur.events, optional: true });
+  if (isFull && Array.isArray(d.attendance)) plan.push({ key: 'attendance', title: '출석기록', path: PATHS.attendance, fallback: [], mode: 'replace', data: d.attendance, current: cur.attendance, optional: true });
+  if (isFull && d.settings && typeof d.settings === 'object' && !Array.isArray(d.settings)) plan.push({ key: 'settings', title: '지급 설정', path: PATHS.settings, fallback: { rate: 15000 }, mode: 'replace', data: d.settings, current: cur.settings, optional: true });
+  if (kind === 'member-deleted' && d.member) plan.push({ key: 'member', title: '삭제한 조합원', path: PATHS.members, fallback: [], mode: 'readd-member', item: d.member, current: cur.members });
+  if (kind === 'event-deleted' && d.event) {
+    plan.push({ key: 'event', title: '삭제한 일정', path: PATHS.events, fallback: [], mode: 'readd-event', item: d.event, current: cur.events });
+    plan.push({ key: 'att', title: '그 일정의 출석기록', path: PATHS.attendance, fallback: [], mode: 'readd-att', items: Array.isArray(d.attendance) ? d.attendance : [], current: cur.attendance });
+  }
+  if (kind === 'orphan-attendance' && Array.isArray(d.attendance)) plan.push({ key: 'att', title: '정리했던 출석기록', path: PATHS.attendance, fallback: [], mode: 'readd-att', items: d.attendance, current: cur.attendance });
+  if (plan.length === 0) { bg.remove(); alert('복원할 내용을 찾지 못했습니다.'); return; }
+  const dsOf = { members: 'members', member: 'members', events: 'events', event: 'events', attendance: 'attendance', att: 'attendance', settings: 'settings' };
+  plan.forEach(p => { p.ds = dsOf[p.key]; p.baseSha = cur._sha[p.ds]; });   // 미리보기 시점의 파일 식별값
+  const sizeText = (ds, v) => ds === 'settings' ? `${Number(v.rate).toLocaleString()}원` : `${v.length.toLocaleString()}건`;
+
+  const attKey = (a) => `${a.eventId}|${memKey(a)}`;
+  const describe = (p) => {
+    if (p.mode === 'replace') {
+      if (p.key === 'members') {
+        const curMap = new Map(p.current.map(m => [memKey(m), m])), bakMap = new Map(p.data.map(m => [memKey(m), m]));
+        let add = 0, chg = 0, rem = 0;
+        bakMap.forEach((m, k) => { const c = curMap.get(k); if (!c) add++; else if (!sameMember(c, m)) chg++; });
+        curMap.forEach((m, k) => { if (!bakMap.has(k)) rem++; });
+        return `현재 ${p.current.length.toLocaleString()}명 → 백업 ${p.data.length.toLocaleString()}명으로 교체 (되살아남 ${add}명 · 값이 바뀜 ${chg}명 · 사라짐 ${rem}명)`;
+      }
+      if (p.key === 'settings') return `현재 ${Number(p.current.rate).toLocaleString()}원 → 백업 ${Number(p.data.rate).toLocaleString()}원`;
+      return `현재 ${p.current.length.toLocaleString()}건 → 백업 ${p.data.length.toLocaleString()}건으로 교체`;
+    }
+    if (p.mode === 'readd-member') return p.current.some(m => memKey(m) === memKey(p.item)) ? '이미 명단에 있어 건너뜁니다.' : `${esc(p.item.empId)} ${esc(p.item.name)} 님을 명단에 다시 추가합니다.`;
+    if (p.mode === 'readd-event') return p.current.some(e => e.id === p.item.id) ? '이미 일정에 있어 건너뜁니다.' : `${esc(p.item.date)} ${esc(p.item.name)} 일정을 다시 추가합니다.`;
+    const have = new Set(p.current.map(attKey));
+    const n = p.items.filter(a => !have.has(attKey(a))).length;
+    return `출석기록 ${n.toLocaleString()}건을 다시 추가합니다. (이미 있는 ${(p.items.length - n).toLocaleString()}건은 건너뜀)`;
+  };
+
+  modal.innerHTML = `
+    <h3 style="margin-top:0;">백업에서 복원</h3>
+    ${notice ? `<div class="notice" style="background:#fff0f0; color:#c62828;">${notice}</div>` : ''}
+    <div style="font-size:12.5px; color:#888; margin-bottom:8px;">${esc(label || '')} · ${esc(BACKUP_LABELS[kind] || kind)} · 백업 시각 ${esc(rec.createdAt || '')}</div>
+    ${plan.map(p => `<div style="padding:8px 0; border-top:1px solid #edf0f4;">${p.optional
+      ? `<label style="display:flex; gap:8px; align-items:center; margin:0; font-weight:700;"><input type="checkbox" id="rs_${p.key}" checked style="width:auto;" />${esc(p.title)}</label>`
+      : `<b>${esc(p.title)}</b>`}<div style="font-size:12.5px; margin-top:4px;">${describe(p)}</div></div>`).join('')}
+    <div class="notice">복원 직전의 현재 데이터는 자동으로 백업됩니다. <b>미리보기 이후 다른 사용자가 같은 데이터를 바꿨다면 덮어쓰지 않고 중단</b>하며, 최신 상태로 다시 비교해서 보여드립니다. 복원이 끝나면 다시 읽어서 건수와 주요 필드가 백업과 같은지 확인합니다.</div>
+    <div id="rs_result" style="font-size:12.5px; margin-top:10px;"></div>
+    <div class="actions"><button class="ghost" id="rs_cancel">취소</button><button class="primary" id="rs_go">복원 진행</button></div>`;
+  modal.querySelector('#rs_cancel').onclick = () => bg.remove();
+  modal.querySelector('#rs_go').onclick = async () => {
+    const chosen = plan.filter(p => !p.optional || modal.querySelector(`#rs_${p.key}`).checked);
+    if (chosen.length === 0) return alert('복원할 항목을 선택하세요.');
+    if (!confirm('선택한 항목을 백업 시점으로 복원합니다. 계속할까요?')) return;
+    const go = modal.querySelector('#rs_go'), cancel = modal.querySelector('#rs_cancel'), out = modal.querySelector('#rs_result');
+    go.disabled = true; cancel.disabled = true; go.textContent = '⏳ 복원 중...';
+    const fail = (msg) => { out.innerHTML = `<div class="notice" style="background:#fdeaea; color:#c62828;">${esc(msg)}</div>`; go.textContent = '복원 진행'; go.disabled = false; cancel.disabled = false; };
+    // 다른 사용자의 변경이 감지되면: 아무것도 저장하지 않고, 최신 상태로 다시 비교한 화면을 보여준다. (자동 덮어쓰기 금지)
+    const reopenWithNotice = async (changedPlans) => {
+      let fresh;
+      try { fresh = await readAllDataFresh(); } catch (err) { return fail('다른 사용자의 변경이 감지되어 복원하지 않았습니다. (최신 데이터를 다시 읽지 못했습니다: ' + (err.message || err) + ')'); }
+      const lines = changedPlans.map(p => { const a = sizeText(p.ds, cur[p.ds]), b = sizeText(p.ds, fresh[p.ds]); return `${esc(p.title)}: ${esc(a)} → ${esc(b)}${a === b ? ' (건수는 같지만 내용이 바뀜)' : ''}`; }).join(' · ');
+      bg.remove();
+      openRestoreModal(rec, label, `<b>⚠ 미리보기 이후 다른 사용자가 데이터를 변경해서 복원하지 않았습니다.</b><br/>변경된 항목: ${lines}<br/>아래는 <b>최신 상태로 다시 비교한 결과</b>입니다. 이 상태에서 복원하면 위 변경 내용이 백업 시점으로 되돌아갑니다. 확인 후 다시 진행하세요.`);
+    };
+    // 0) 저장 시점의 "실제 최신 데이터"를 읽는다. 승인한 화면의 데이터와 같은지 확인하고, 복원 직전 백업도 이 데이터로 만든다.
+    out.textContent = '저장 시점의 최신 데이터를 확인하는 중...';
+    const touchedDs = [...new Set(chosen.map(p => p.ds))];
+    const fresh = {};
+    try {
+      const fb = { members: [], events: [], attendance: [], settings: { rate: 15000 } };
+      await Promise.all(touchedDs.map(async ds => { fresh[ds] = await ghGetJSON(PATHS[ds], fb[ds]); }));
+    } catch (err) { return fail('최신 데이터를 읽지 못해 복원하지 않았습니다: ' + (err.message || err)); }
+    const changed = chosen.filter(p => p.mode === 'replace' && changedSince(p.baseSha, p.current, fresh[p.ds].sha, fresh[p.ds].data));
+    if (changed.length) return reopenWithNotice(changed);
+    // 1) 복원 직전 백업: 방금 읽은 실제 최신 데이터 기준
+    out.textContent = '복원 직전 상태를 백업하는 중...';
+    let preBackup; const snap = {};
+    try {
+      touchedDs.forEach(ds => { snap[ds] = fresh[ds].data; });
+      preBackup = await writeBackup('full-before-restore', snap, `복원 대상: ${label || kind}`);
+    } catch (err) { return fail('복원 직전 백업에 실패해 복원하지 않았습니다: ' + (err.message || err)); }
+    // 복원 도중 일부만 반영된 경우를 위한 [복원 직전 상태로 되돌리기]: 방금 만든 백업과 같은 내용으로 복원 화면을 다시 연다. (되돌리기도 같은 안전 절차를 거친다)
+    const offerUndo = () => {
+      const b = document.createElement('button');
+      b.className = 'ghost'; b.id = 'rs_undo'; b.style.marginTop = '8px'; b.textContent = '복원 직전 상태로 되돌리기';
+      b.onclick = () => { bg.remove(); openRestoreModal({ app: 'strike-attendance', version: 1, kind: 'full-before-restore', createdAt: new Date().toISOString(), data: snap }, '복원 직전 상태(되돌리기)'); };
+      out.appendChild(b);
+    };
+    // 2) 복원 (교체형은 저장 순간에도 sha를 다시 확인한다)
+    out.textContent = '복원 중...';
+    const done = [];
+    for (const p of chosen) {
+      let res;
+      if (p.mode === 'replace') res = await mutateJSON(p.path, p.fallback, (latest, meta) => {
+        if (changedSince(p.baseSha, p.current, meta.sha, latest)) throw new StaleError('복원 도중 다른 사용자가 변경했습니다.', latest, meta.sha);
+        return { data: p.data };
+      }, `백업에서 복원: ${p.title}`);
+      else if (p.mode === 'readd-member') res = await mutateJSON(p.path, p.fallback, (list) => list.some(m => memKey(m) === memKey(p.item)) ? null : { data: [...list, p.item] }, `백업에서 복원: 조합원 ${p.item.empId}`);
+      else if (p.mode === 'readd-event') res = await mutateJSON(p.path, p.fallback, (list) => list.some(e => e.id === p.item.id) ? null : { data: [...list, p.item] }, `백업에서 복원: 일정 ${p.item.id}`);
+      else res = await mutateJSON(p.path, p.fallback, (list) => { const have = new Set(list.map(attKey)); const add = p.items.filter(a => !have.has(attKey(a))); return add.length ? { data: [...list, ...add] } : null; }, '백업에서 복원: 출석기록');
+      if (!res.ok) {
+        if (res.stale && done.length === 0) return reopenWithNotice([p]);
+        if (res.stale) { fail(`${p.title}은(는) 복원 도중 다른 사용자가 변경해서 복원하지 않았습니다(덮어쓰지 않음). 이미 복원된 항목: ${done.join(', ')}. 복원 직전 백업: ${preBackup}`); offerUndo(); return; }
+        fail(`${p.title} 복원 중 오류: ${res.error} (일부만 복원됐을 수 있습니다. 화면을 새로고침해서 확인하세요. 복원 직전 백업: ${preBackup})`); if (done.length) offerUndo(); return;
+      }
+      done.push(p.title);
+    }
+    // 3) 복원 결과 검증: 다시 읽어서 건수와 주요 필드가 백업과 같은지
+    out.textContent = '복원 결과를 다시 읽어 확인하는 중...';
+    let after;
+    try { after = await readAllDataFresh(); } catch (err) { fail('복원은 했지만 결과를 다시 읽지 못해 검증하지 못했습니다: ' + (err.message || err)); offerUndo(); return; }
+    const report = chosen.map(p => { const v = verifyRestore(p, after[p.ds]); v.text = `복원 전 ${sizeText(p.ds, p.current)} → 복원 후 ${sizeText(p.ds, after[p.ds])} · ${v.text}`; return v; });
+    const allOk = report.every(r => r.ok);
+    out.innerHTML = `<div class="notice" style="${allOk ? 'background:#e9f7ee; color:#1a7f37;' : 'background:#fdeaea; color:#c62828;'}"><b>${allOk ? '복원 검증 통과' : '복원 결과가 백업과 일치하지 않습니다 (복원 중 다른 사용자가 저장했을 수 있습니다)'}</b><br/>${report.map(r => `${r.ok ? '✔' : '✖'} ${esc(r.title)}: ${esc(r.text)}`).join('<br/>')}<br/>복원 직전 백업: ${esc(preBackup)}</div>`;
+    if (!allOk) offerUndo();
+    go.style.display = 'none'; cancel.disabled = false; cancel.textContent = '닫기';
+    cancel.onclick = () => { bg.remove(); const active = document.querySelector('.tabbtn.primary'); goTab(active ? active.dataset.tab : 'users'); };
+  };
+}
+
 // 자동 진단과 연명부: 원본 데이터는 수정하지 않고 분석합니다.
 const DX_HELP = {
   '중복 사번':'명단에 같은 사번이 두 번 있습니다. 한 명만 남기고 정리하세요.',
